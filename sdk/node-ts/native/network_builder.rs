@@ -165,9 +165,9 @@ impl JsNetworkBuilder {
     ) -> Result<&Self> {
         let initial = JsSecretBuilder::new().into_instance(env)?;
         let mut returned = configure.call(initial)?;
-        let secret_builder = returned.take_inner_builder()?;
+        let entry = returned.take_built()?;
         let prev = self.take_inner();
-        self.inner = Some(prev.secret(|_default| secret_builder));
+        self.inner = Some(prev.secret_entry(entry));
         Ok(self)
     }
 
@@ -285,9 +285,9 @@ impl JsNetworkBuilder {
             .as_ref()
             .ok_or_else(|| napi::Error::from_reason("NetworkBuilder already consumed"))?
             .clone();
-        let cfg = cloned
-            .build()
-            .map_err(|e| napi::Error::from_reason(format!("{e}")))?;
+        let cfg = cloned.build().map_err(|e| {
+            napi::Error::from_reason(format!("[InvalidConfig] network builder: {e}"))
+        })?;
         serde_json::to_string(&cfg)
             .map_err(|e| napi::Error::from_reason(format!("network config serialize: {e}")))
     }

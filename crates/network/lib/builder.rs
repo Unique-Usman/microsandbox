@@ -164,11 +164,13 @@ impl NetworkBuilder {
     ///     .allow_host("api.openai.com")
     /// )
     /// ```
-    pub fn secret(mut self, f: impl FnOnce(SecretBuilder) -> SecretBuilder) -> Self {
-        self.config
-            .secrets
-            .secrets
-            .push(f(SecretBuilder::new()).build());
+    pub fn secret(self, f: impl FnOnce(SecretBuilder) -> SecretBuilder) -> Self {
+        self.secret_entry(f(SecretBuilder::new()).build())
+    }
+
+    /// Add a materialized secret entry.
+    pub fn secret_entry(mut self, entry: SecretEntry) -> Self {
+        self.config.secrets.secrets.push(entry);
         self
     }
 
@@ -260,6 +262,7 @@ impl NetworkBuilder {
         if let Some(err) = self.errors.drain(..).next() {
             return Err(err);
         }
+        self.config.secrets.validate()?;
         Ok(self.config)
     }
 }
@@ -388,6 +391,9 @@ impl SecretBuilder {
     }
 
     /// Set the environment variable to expose the placeholder as (required).
+    ///
+    /// Names must be non-empty and must not contain `=` or NUL. They are
+    /// not restricted to shell-identifier syntax.
     pub fn env(mut self, var: impl Into<String>) -> Self {
         self.env_var = Some(var.into());
         self
@@ -400,6 +406,9 @@ impl SecretBuilder {
     }
 
     /// Set a custom placeholder string.
+    ///
+    /// Placeholders must be non-empty, at most 1024 bytes, and must not
+    /// contain NUL, CR, or LF.
     /// If not set, auto-generated as `$MSB_<env_var>`.
     pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
         self.placeholder = Some(placeholder.into());
@@ -461,7 +470,12 @@ impl SecretBuilder {
         self
     }
 
-    /// Configure body injection (default: false).
+    /// Configure HTTP/1 body injection (default: false).
+    ///
+    /// Fixed-length bodies up to 16 MiB update `Content-Length`; larger
+    /// fixed-length bodies are blocked. Chunked bodies are decoded and
+    /// re-encoded with fresh chunk sizes. Encoded bodies pass through
+    /// unchanged.
     pub fn inject_body(mut self, enabled: bool) -> Self {
         self.injection.body = enabled;
         self
@@ -470,10 +484,14 @@ impl SecretBuilder {
     /// Consume the builder and return a [`SecretEntry`].
     ///
     /// # Panics
-    /// Panics if `env` or `value` was not set.
+    /// Panics if `env`, `value`, or at least one allowed host was not set.
     pub fn build(self) -> SecretEntry {
         let env_var = self.env_var.expect("SecretBuilder: .env() is required");
         let value = self.value.expect("SecretBuilder: .value() is required");
+        assert!(
+            !self.allowed_hosts.is_empty(),
+            "SecretBuilder: at least one allowed host is required; use .allow_any_host_dangerous(true) for an explicit any-host secret"
+        );
         let placeholder = self
             .placeholder
             .unwrap_or_else(|| format!("$MSB_{env_var}"));
@@ -653,6 +671,33 @@ mod tests {
                 HostPattern::Wildcard("*.anthropic.com".into()),
             ])),
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "SecretBuilder: at least one allowed host is required")]
+    fn secret_builder_rejects_empty_allowed_hosts() {
+        let _ = SecretBuilder::new()
+            .env("TOKEN")
+            .value("secret-value")
+            .build();
+    }
+
+    #[test]
+    fn network_builder_rejects_invalid_secret_config() {
+        let err = NetworkBuilder::new()
+            .secret_entry(SecretEntry {
+                env_var: "API=KEY".into(),
+                value: "secret-value".into(),
+                placeholder: "$MSB_API_KEY".into(),
+                allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
+                injection: SecretInjection::default(),
+                on_violation: None,
+                require_tls_identity: true,
+            })
+            .build()
+            .unwrap_err();
+
+        assert!(err.to_string().contains("env_var must not contain `=`"));
     }
 
     #[test]

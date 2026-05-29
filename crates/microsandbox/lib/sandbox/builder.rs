@@ -506,8 +506,16 @@ impl SandboxBuilder {
     ///
     /// Automatically enables TLS interception if not already enabled.
     #[cfg(feature = "net")]
-    pub fn secret(mut self, f: impl FnOnce(SecretBuilder) -> SecretBuilder) -> Self {
-        let entry = f(SecretBuilder::new()).build();
+    pub fn secret(self, f: impl FnOnce(SecretBuilder) -> SecretBuilder) -> Self {
+        self.secret_entry(f(SecretBuilder::new()).build())
+    }
+
+    /// Add a materialized secret entry.
+    #[cfg(feature = "net")]
+    pub fn secret_entry(
+        mut self,
+        entry: microsandbox_network::secrets::config::SecretEntry,
+    ) -> Self {
         self.config.network.secrets.secrets.push(entry);
         // Auto-enable TLS when secrets are configured.
         if !self.config.network.tls.enabled {
@@ -859,6 +867,11 @@ impl SandboxBuilder {
             super::init::validate(spec)?;
         }
 
+        #[cfg(feature = "net")]
+        self.config.network.secrets.validate().map_err(|err| {
+            crate::MicrosandboxError::InvalidConfig(format!("invalid network secrets: {err}"))
+        })?;
+
         // Reject any two DiskImage mounts pointing at the same host file.
         // Each virtio-blk device caches independently on the host, so any
         // mix of writable+writable, writable+read-only, or even two
@@ -915,6 +928,8 @@ mod tests {
     use crate::sandbox::{MAX_SANDBOX_NAME_BYTES, RlimitResource};
     #[cfg(feature = "net")]
     use microsandbox_network::config::PortProtocol;
+    #[cfg(feature = "net")]
+    use microsandbox_network::secrets::config::{HostPattern, SecretEntry, SecretInjection};
     #[cfg(feature = "net")]
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -1221,6 +1236,27 @@ mod tests {
         assert_eq!(config.network.ports[0].protocol, PortProtocol::Tcp);
         assert_eq!(config.network.secrets.secrets.len(), 1);
         assert_eq!(config.network.max_connections, Some(128));
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_rejects_invalid_secret_config() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .secret_entry(SecretEntry {
+                env_var: "API\0KEY".into(),
+                value: "secret".into(),
+                placeholder: "$MSB_API_KEY".into(),
+                allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
+                injection: SecretInjection::default(),
+                on_violation: None,
+                require_tls_identity: true,
+            })
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("env_var must not contain NUL"));
     }
 
     //----------------------------------------------------------------------------------------------
