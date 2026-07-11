@@ -15,6 +15,7 @@ path = "lib/lib.rs"
 default = ["prebuilt", "net"]
 prebuilt = ["microsandbox-filesystem/prebuilt"]
 net = ["dep:microsandbox-network", "msb_krun/net"]
+oci-runtime = []
 
 [dependencies]
 bytes = { workspace = true }
