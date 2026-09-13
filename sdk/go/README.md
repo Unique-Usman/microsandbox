@@ -27,7 +27,7 @@ For the full API reference and longer guides, use Go docs and the microsandbox d
 
 - Go 1.22+
 - CGO enabled and a C compiler/toolchain available
-- Linux with KVM, macOS with Apple Silicon, or Windows 10/11 with Windows Hypervisor Platform enabled
+- Linux with KVM, macOS with Apple Silicon, or Windows 11 with WHP enabled
 
 ## Supported Platforms
 
@@ -102,6 +102,25 @@ func main() {
     }
     fmt.Println(out.Stdout())
 }
+```
+
+### Reusable Lifecycle Convergence
+
+Use `ConnectOrCreateSandbox` when a stable name should converge on one persisted sandbox. Existing configuration wins; options are used only if creation is necessary. Handles retain a stable `ID`, so lifecycle calls on stale receivers refuse to act on a replacement that reused the name.
+
+```go
+sb, err := microsandbox.ConnectOrCreateSandbox(ctx, "worker",
+    microsandbox.WithImage("python"),
+    microsandbox.WithMemory(1024),
+)
+
+fmt.Printf("%s: %s\n", sb.Name(), sb.ID())
+handle, err := microsandbox.GetSandbox(ctx, "worker")
+running, err := handle.ConnectOrStart(ctx)
+err = running.RequestStop(ctx)
+stopped, err := running.WaitForStatus(ctx, microsandbox.SandboxStatusStopped)
+restarted, err := stopped.Restart(ctx)
+err = restarted.Destroy(ctx)
 ```
 
 ## Common Examples

@@ -25,7 +25,7 @@ For full API documentation, use the docs site and generated Rust docs:
 ## Requirements
 
 - Rust toolchain with Rust 2024 edition support
-- Linux with KVM, macOS with Apple Silicon, or Windows with Windows Hypervisor Platform
+- Linux with KVM, macOS with Apple Silicon, or Windows 11 (x64 or ARM64) with WHP enabled
 - Windows support is currently preview; see the [Windows troubleshooting guide](https://docs.microsandbox.dev/troubleshooting/windows) for WHP and runtime setup notes.
 
 ## Installation
@@ -72,6 +72,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+```
+
+### Reusable Lifecycle Convergence
+
+Use `connect_or_create` when a stable name should converge on one persisted sandbox. Existing configuration wins; the builder is used only if creation is necessary. Handles retain a stable `id`, so lifecycle calls on stale receivers refuse to act on a replacement that reused the name.
+
+```rust
+let sandbox = Sandbox::builder("worker")
+    .image("python")
+    .memory(1024)
+    .connect_or_create()
+    .await?;
+
+println!("{}: {}", sandbox.name(), sandbox.id());
+let running = Sandbox::get("worker").await?.connect_or_start().await?;
+running.request_stop().await?;
+let stopped = running
+    .wait_for_status(microsandbox::sandbox::SandboxStatus::Stopped)
+    .await?;
+let restarted = stopped.restart().await?;
+restarted.destroy().await?;
 ```
 
 ## Common Examples

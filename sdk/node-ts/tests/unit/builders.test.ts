@@ -12,6 +12,7 @@ import {
   RootDiskBuilder,
   Sandbox,
   SecretBuilder,
+  SecretSource,
   Stdin,
 } from "../../dist/index.js";
 
@@ -305,6 +306,31 @@ describe("MountBuilder", () => {
     expect(() => builder.build()).toThrow(/Off cannot be combined with/);
   });
 
+  it("preserves an explicit mount owner including root and max IDs", () => {
+    expect(new MountBuilder("/data").bind("/host").owner(0, 0).build()).toMatchObject({
+      overrideUid: 0,
+      overrideGid: 0,
+    });
+    expect(
+      new MountBuilder("/max")
+        .bind("/host")
+        .owner(0xffffffff, 0xffffffff)
+        .build(),
+    ).toMatchObject({ overrideUid: 0xffffffff, overrideGid: 0xffffffff });
+  });
+
+  it.each([-1, 1.5, 0x100000000, Number.NaN, Infinity, -Infinity])(
+    "rejects invalid mount owner ID %s at the JavaScript boundary",
+    (id) => {
+      expect(() => new MountBuilder("/data").bind("/host").owner(id, 1000)).toThrow(
+        /mount owner uid must be an integer/,
+      );
+      expect(() => new MountBuilder("/data").bind("/host").owner(1000, id)).toThrow(
+        /mount owner gid must be an integer/,
+      );
+    },
+  );
+
   it("rejects commas in bind host paths at build time", () => {
     const builder = new MountBuilder("/data").bind("/host/with,comma");
     expect(() => builder.build()).toThrow(/must not contain ','/);
@@ -354,6 +380,60 @@ describe("SandboxBuilder.build", () => {
       (cfg.resources as { placementProfile: string }).placementProfile,
     ).toBe("latency");
     expect((cfg.resources as { thp: string }).thp).toBe("always");
+  });
+
+  it("renders a configured outbound proxy in canonical form", async () => {
+    const cfg = await Sandbox.builder("x")
+      .image("alpine")
+      .proxy((p) => p.socks5("127.0.0.1:1080"))
+      .network((n) => n.maxConnections(64))
+      .build();
+
+    expect(cfg.network).toMatchObject({
+      outboundProxy: {
+        protocol: "socks5",
+        address: "127.0.0.1:1080",
+      },
+      maxConnections: 64,
+    });
+  });
+
+  it("renders SOCKS5 credentials in canonical form", async () => {
+    const cfg = await Sandbox.builder("x")
+      .image("alpine")
+      .proxy((p) =>
+        p
+          .socks5("127.0.0.1:1080")
+          .credentials("sandbox", SecretSource.env("SOCKS5_PASSWORD")),
+      )
+      .build();
+
+    expect(cfg.network?.outboundProxy).toEqual({
+      protocol: "socks5",
+      address: "127.0.0.1:1080",
+      credentials: {
+        username: "sandbox",
+        password: {
+          kind: "env",
+          var: "SOCKS5_PASSWORD",
+        },
+      },
+    });
+  });
+
+  it("renders a SOCKS4 proxy with an optional user ID", async () => {
+    const cfg = await Sandbox.builder("x")
+      .image("alpine")
+      .proxy((p) => p.socks4("127.0.0.1:1080").userId("sandbox"))
+      .build();
+
+    expect(cfg.network).toMatchObject({
+      outboundProxy: {
+        protocol: "socks4",
+        address: "127.0.0.1:1080",
+        userId: "sandbox",
+      },
+    });
   });
 
   it("collects volumes through the MountBuilder callback", async () => {
@@ -531,6 +611,13 @@ describe("InterfaceOverridesBuilder", () => {
     expect(cfg.interface.ipv4Pool).toBe("172.31.240.0/24");
     expect(cfg.interface.ipv6Pool).toBe("fd7a:115c:a1e0:100::/56");
   });
+
+  it("sets strict hostname policy mode", () => {
+    const cfg = new NetworkBuilder().strict(true).build() as {
+      strict: boolean;
+    };
+    expect(cfg.strict).toBe(true);
+  });
 });
 
 describe("NetworkBuilder.secretEnvSimple (3-arg shorthand)", () => {
@@ -624,6 +711,22 @@ describe("NetworkBuilder ports", () => {
       guestPort: 53,
       protocol: "udp",
     });
+  });
+});
+
+describe("SandboxBuilder outbound proxy", () => {
+  it("rejects invalid addresses", () => {
+    expect(() =>
+      Sandbox.builder("x").proxy((p) => p.socks5("not-an-address")),
+    ).toThrow(/invalid SOCKS5 proxy address/);
+  });
+
+  it("rejects invalid SOCKS4 user IDs", () => {
+    expect(() =>
+      Sandbox.builder("x").proxy((p) =>
+        p.socks4("127.0.0.1:1080").userId(""),
+      ),
+    ).toThrow(/invalid SOCKS4 user ID/);
   });
 });
 

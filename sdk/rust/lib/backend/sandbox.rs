@@ -20,7 +20,7 @@ use futures::future::BoxFuture;
 use super::Backend;
 use crate::MicrosandboxResult;
 use crate::agent::AgentClient;
-use crate::logs::{LogEntry, LogOptions, LogStreamOptions};
+use crate::logs::{BootError, LogEntry, LogOptions, LogStreamOptions};
 use crate::runtime::ProcessHandle;
 use crate::sandbox::exec::{ExecHandle, ExecOptions, ExecOutput};
 use crate::sandbox::fs::{FsEntry, FsMetadata, FsReadStream, FsWriteSink};
@@ -88,6 +88,17 @@ pub enum SandboxHandleInner {
     Local(SandboxHandleLocalState),
     /// Cloud msb-cloud sandbox handle.
     Cloud(SandboxHandleCloudState),
+}
+
+/// Backend-private selector used to protect receiver-based lifecycle calls
+/// from acting on a different sandbox that reused the same name.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SandboxIdentity {
+    /// Local SQLite sandbox row id.
+    Local(i32),
+    /// Cloud control-plane sandbox UUID.
+    Cloud(String),
 }
 
 /// Local handle state. Snapshot of the database row + active PID, if any.
@@ -175,6 +186,32 @@ pub trait SandboxBackend: Send + Sync {
         name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>>;
 
+    /// Start the exact persisted sandbox identified by `identity`.
+    ///
+    /// Custom backends should override this method with an atomic or
+    /// ID-addressed implementation. The default delegates by name only to
+    /// preserve source compatibility for existing backend implementations.
+    fn start_identified<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+        _identity: SandboxIdentity,
+    ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
+        self.start(backend, name)
+    }
+
+    /// Start the exact persisted sandbox in detached mode.
+    ///
+    /// Custom backends should override this method for identity safety.
+    fn start_detached_identified<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+        _identity: SandboxIdentity,
+    ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
+        self.start_detached(backend, name)
+    }
+
     /// Get a sandbox handle by name.
     fn get<'a>(
         &'a self,
@@ -196,12 +233,36 @@ pub trait SandboxBackend: Send + Sync {
         name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>>;
 
+    /// Remove the exact persisted sandbox identified by `identity`.
+    ///
+    /// Custom backends should override this method for identity safety.
+    fn remove_identified<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+        _identity: SandboxIdentity,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        self.remove(backend, name)
+    }
+
     /// Stop a running sandbox by name (graceful).
     fn stop<'a>(
         &'a self,
         backend: Arc<dyn Backend>,
         name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>>;
+
+    /// Stop the exact persisted sandbox identified by `identity`.
+    ///
+    /// Custom backends should override this method for identity safety.
+    fn stop_identified<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+        _identity: SandboxIdentity,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        self.stop(backend, name)
+    }
 
     /// Kill a running sandbox by name (SIGKILL).
     fn kill<'a>(
@@ -210,12 +271,36 @@ pub trait SandboxBackend: Send + Sync {
         name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>>;
 
+    /// Kill the exact persisted sandbox identified by `identity`.
+    ///
+    /// Custom backends should override this method for identity safety.
+    fn kill_identified<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+        _identity: SandboxIdentity,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        self.kill(backend, name)
+    }
+
     /// Trigger a graceful drain on a sandbox by name.
     fn drain<'a>(
         &'a self,
         backend: Arc<dyn Backend>,
         name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>>;
+
+    /// Drain the exact persisted sandbox identified by `identity`.
+    ///
+    /// Custom backends should override this method for identity safety.
+    fn drain_identified<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+        _identity: SandboxIdentity,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        self.drain(backend, name)
+    }
 
     // ============================================================
     // Exec
@@ -271,6 +356,14 @@ pub trait SandboxBackend: Send + Sync {
     // Logs / metrics
     // ============================================================
 
+    /// Return the most recent startup diagnostic for the named sandbox, when
+    /// the selected backend provides one.
+    fn boot_error<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<Option<BootError>>>;
+
     /// Read captured output for the named sandbox.
     fn logs<'a>(
         &'a self,
@@ -285,6 +378,17 @@ pub trait SandboxBackend: Send + Sync {
         backend: Arc<dyn Backend>,
         name: &'a str,
         opts: &'a LogStreamOptions,
+    ) -> BoxFuture<'a, MicrosandboxResult<LogStream>>;
+
+    /// Replay a filtered snapshot, then follow new log entries.
+    ///
+    /// The backend owns the snapshot-to-stream handoff so callers do not need
+    /// backend-specific cursor or transport logic.
+    fn follow_logs<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+        opts: &'a LogOptions,
     ) -> BoxFuture<'a, MicrosandboxResult<LogStream>>;
 
     /// Latest metrics sample for the named sandbox.

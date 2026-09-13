@@ -45,15 +45,15 @@
 
 #### <img height="14" src="https://octicons-col.vercel.app/move-to-bottom/A770EF">&nbsp;&nbsp;Install the SDK
 > ```sh
+> npm i microsandbox                                       # 🟦 TypeScript
+> ```
+>
+> ```sh
 > cargo add microsandbox                                   # 🦀 Rust
 > ```
 >
 > ```sh
 > uv add microsandbox                                      # 🐍 Python
-> ```
->
-> ```sh
-> npm i microsandbox                                       # 🟦 TypeScript
 > ```
 >
 > ```sh
@@ -124,11 +124,31 @@
 
 ## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/package-dependencies/ffffff" alt="sdk-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/package-dependencies/000000" alt="sdk"></a>&nbsp;&nbsp;SDK
 
-The SDK lets you create and control sandboxes directly from your application. `Sandbox::builder("...").create()` boots a microVM as a child process. No infrastructure required.
+The SDK lets you create and control sandboxes directly from your application. `Sandbox.builder("...").create()` boots a microVM as a child process. No infrastructure required.
 
 #### <img height="14" src="https://octicons-col.vercel.app/play/A770EF">&nbsp;&nbsp;Run Code in a Sandbox
 
-> ```rs
+> ```typescript
+> import { Sandbox } from "microsandbox";
+>
+> await using sandbox = await Sandbox.builder("my-sandbox")
+>   .image("python")
+>   .cpus(1)
+>   .memory(512)
+>   .create();
+>
+> const output = await sandbox.exec("python", [
+>   "-c",
+>   "print('Hello from a microVM!')",
+> ]);
+>
+> console.log(output.stdout());
+> ```
+>
+> <details>
+> <summary><b>&nbsp;Rust Example →</b></summary>
+>
+> ```rust
 > use microsandbox::Sandbox;
 >
 > #[tokio::main]
@@ -152,6 +172,7 @@ The SDK lets you create and control sandboxes directly from your application. `S
 > }
 > ```
 >
+> </details>
 > <details>
 > <summary><b>&nbsp;Python Example →</b></summary>
 >
@@ -207,28 +228,6 @@ The SDK lets you create and control sandboxes directly from your application. `S
 >
 > See the [Ruby SDK guide](./sdk/ruby/README.md) for installation, lifecycle,
 > networking, and backend details.
->
-> </details>
->
-> <details>
-> <summary><b>&nbsp;TypeScript Example →</b></summary>
->
-> ```typescript
-> import { Sandbox } from "microsandbox";
->
-> await using sandbox = await Sandbox.builder("my-sandbox")
->   .image("python")
->   .cpus(1)
->   .memory(512)
->   .create();
->
-> const output = await sandbox.exec("python", [
->   "-c",
->   "print('Hello from a microVM!')",
-> ]);
->
-> console.log(output.stdout());
-> ```
 >
 > </details>
 >
@@ -395,6 +394,35 @@ Practical ways to put microsandbox to work:
 
 <br />
 
+## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/people/ffffff" alt="people-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/people/000000" alt="people"></a>&nbsp;&nbsp;Community Showcase
+
+#### <img height="14" src="https://octicons-col.vercel.app/hubot/A770EF">&nbsp;&nbsp;Agent frameworks & runtimes
+
+> • <img height="14" src="https://octicons-col.vercel.app/workflow/A770EF"> **[Eve](https://eve.dev/docs/sandbox#microsandbox) by Vercel**: Agent framework that ships microsandbox as a sandbox backend.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/organization/A770EF"> **[Agentic Coding Quickstart](https://github.com/GSA-TTS/agentic-coding-quickstart) by U.S. GSA**: From zero to a running AI coding agent with USAi in minutes.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/package/A770EF"> **[Condukt](https://github.com/tuist/condukt) and [Once](https://github.com/tuist/once) by Tuist**: Elixir agentic engine, and cacheable actions that run in fresh sandboxes.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/link/A770EF"> **[langchain-microsandbox](https://github.com/kenwoodjw/langchain-microsandbox) by kenwoodjw**: Microsandbox integration for LangChain Deep Agents.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/history/A770EF"> **[Smithers](https://github.com/smithersai/smithers) by Smithers**: Agent workflows with full observability, rewind, fork, and replay.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/terminal/A770EF"> **[wrap](https://github.com/tobi/wrap) by Tobi Lütke**: Run coding agents and project commands in isolated Arch Linux microVMs.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/shield-lock/A770EF"> **[Agent VM](https://github.com/wirenboard/agent-vm) by Wiren Board**: Run AI agents in safe VMs scoped to a local folder.
+
+#### <img height="14" src="https://octicons-col.vercel.app/cpu/A770EF">&nbsp;&nbsp;Tools & infrastructure
+
+> • <img height="14" src="https://octicons-col.vercel.app/browser/A770EF"> **[h5i](https://github.com/h5i-dev/h5i) by h5i**: Secure, auditable browser for AI agents, written in pure Rust.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/cloud/A770EF"> **[Devsy](https://github.com/devsy-org/devsy) by Devsy**: Deploy devcontainers onto any cloud, Kubernetes cluster, or Docker host.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/briefcase/A770EF"> **[OpenWork](https://github.com/different-ai/openwork) by Different AI**: Open-source Claude Cowork alternative with a microsandbox image.
+
+#### <img height="14" src="https://octicons-col.vercel.app/list-unordered/A770EF">&nbsp;&nbsp;Guides & showcases
+
+> • <img height="14" src="https://octicons-col.vercel.app/list-unordered/A770EF"> **[Awesome Microsandbox](https://github.com/ya-luotao/awesome-microsandbox) by ya-luotao**: Curated list of SDKs, integrations, tools, and resources.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/device-desktop/A770EF"> **[msb-omarchy](https://github.com/ya-luotao/msb-omarchy) by ya-luotao**: Omarchy desktop with graphics inside a microVM on Apple Silicon.
+
+<br />
+
+<a href="https://discord.gg/T95Y3XnEAK"><img src="https://img.shields.io/badge/Share_a_Project-%E2%86%92-A770EF?style=flat-square&labelColor=2b2b2b" alt="Share a Project"></a>
+
+<br />
+
 ## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/dependabot/ffffff" alt="agents-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/dependabot/000000" alt="agents"></a>&nbsp;&nbsp;AI Agents
 
 #### <img height="14" src="https://octicons-col.vercel.app/book/A770EF">&nbsp;&nbsp;Agent Skills
@@ -413,23 +441,6 @@ Practical ways to put microsandbox to work:
 > # Claude Code
 > claude mcp add --transport stdio microsandbox -- npx -y microsandbox-mcp
 > ```
-
-<br />
-
-## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/people/ffffff" alt="people-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/people/000000" alt="people"></a>&nbsp;&nbsp;Projects using microsandbox
-
-> ⏵ **[Eve by Vercel](https://eve.dev/docs/sandbox#microsandbox)**<br />
-> ⏵ **[GSA TTS Agentic Coding Quickstart](https://github.com/GSA-TTS/agentic-coding-quickstart)**<br />
-> ⏵ **[agent-compose by Chaitin](https://github.com/chaitin/agent-compose)**<br />
-> ⏵ **[Condukt](https://github.com/tuist/condukt) and [Once](https://github.com/tuist/once) by Tuist**<br />
-> ⏵ **[h5i](https://github.com/h5i-dev/h5i)**<br />
-> ⏵ **[Smithers](https://github.com/smithersai/smithers)**<br />
-> ⏵ **[sandboxed-lit by LlamaIndex](https://github.com/run-llama/sandboxed-lit)**<br />
-> ⏵ **[Agentic Usability by PSPDFKit Labs](https://github.com/PSPDFKit-labs/agentic-usability)**<br />
-> ⏵ **[Agent VM by Wiren Board](https://github.com/wirenboard/agent-vm)**<br />
-> ⏵ **[Devsy](https://github.com/devsy-org/devsy)**
-
-> Built something with microsandbox? [Share it with us on Discord](https://discord.gg/T95Y3XnEAK). We’d love to feature it here.
 
 <br />
 

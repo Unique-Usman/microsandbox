@@ -85,8 +85,7 @@ require "microsandbox"
 Microsandbox.install unless Microsandbox.installed?
 ```
 
-Local sandboxes require Apple Silicon virtualization on macOS, KVM on Linux,
-or WHP on Windows. Ruby CI currently covers Linux x86_64.
+Local sandboxes require Apple Silicon virtualization on macOS or KVM on Linux. On Windows, use Windows 11 on x64 or ARM64 and enable WHP. Ruby CI currently covers Linux x86_64.
 
 ## Quick start
 
@@ -132,6 +131,25 @@ exception is preserved.
 
 Blocking calls do not prevent other Ruby threads from running. Forked child
 processes recreate the native runtime before use.
+
+Use `connect_or_create` when a stable name should converge on one persisted sandbox. Existing configuration wins; options are used only if creation is necessary. Handles retain a stable `id`, so lifecycle calls on stale receivers refuse to act on a replacement that reused the name.
+
+```ruby
+sandbox = Microsandbox::Sandbox.connect_or_create(
+  "worker",
+  image: "python",
+  memory: 1024
+)
+
+puts "#{sandbox.name}: #{sandbox.id}"
+running = Microsandbox::Sandbox.get("worker").connect_or_start
+running.request_stop
+stopped = running.wait_for_status("stopped")
+restarted = stopped.restart
+restarted.destroy
+```
+
+Run `ruby examples/lifecycle_convergence.rb` from `sdk/ruby` to exercise the complete local lifecycle against a live microVM. The example verifies convergence, restart, destroy, and stale-handle identity safety, then emits machine-readable timing metrics.
 
 ## Networking and secrets
 

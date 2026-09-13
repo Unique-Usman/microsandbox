@@ -1,6 +1,6 @@
 use microsandbox::sandbox::{
     CpuPlacement, DeploymentProfile, NetworkPolicy, Patch, PullPolicy, SandboxBuilder,
-    SecurityProfile, TransparentHugePagePolicy,
+    SecretSource, SecurityProfile, TransparentHugePagePolicy,
 };
 use microsandbox::{LogLevel, RegistryAuth};
 use microsandbox_network::dns::Nameserver;
@@ -50,6 +50,7 @@ const KNOWN_CREATE_KWARGS: &[&str] = &[
     "ports",
     "vsock",
     "network",
+    "proxy",
     "secrets",
     "on_secret_violation",
     "detached",
@@ -568,6 +569,69 @@ pub fn sandbox_builder_from_args(
         builder = apply_network(builder, &net_dict)?;
     }
 
+    // Outbound proxy.
+    if let Some(proxy) = kwargs.get_item("proxy")?
+        && !proxy.is_none()
+    {
+        let proxy = config_dict(&proxy, "OutboundProxy")?;
+        let protocol = extract_required::<String>(&proxy, "protocol")?;
+        let address = extract_required::<String>(&proxy, "address")?;
+        builder = match protocol.as_str() {
+            "socks4" => {
+                let user_id = extract_opt::<String>(&proxy, "user_id")?;
+                builder.proxy(move |p| {
+                    let proxy = p.socks4(address);
+                    match user_id {
+                        Some(user_id) => proxy.user_id(user_id),
+                        None => proxy,
+                    }
+                })
+            }
+            "socks5" => {
+                let credentials = proxy
+                    .get_item("credentials")?
+                    .filter(|value| !value.is_none())
+                    .map(|value| config_dict(&value, "SOCKS5 credentials"))
+                    .transpose()?;
+                let username = credentials
+                    .as_ref()
+                    .map(|value| extract_required::<String>(value, "username"))
+                    .transpose()?;
+                let password = credentials
+                    .as_ref()
+                    .map(|value| {
+                        let password = value.get_item("password")?.ok_or_else(|| {
+                            pyo3::exceptions::PyValueError::new_err(
+                                "SOCKS5 credentials requires password",
+                            )
+                        })?;
+                        let source = config_dict(&password, "SOCKS5 password source")?;
+                        let kind = extract_required::<String>(&source, "kind")?;
+                        if kind != "env" {
+                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                                "unsupported SOCKS5 password source {kind:?}; only env is supported"
+                            )));
+                        }
+                        let var = extract_required::<String>(&source, "var")?;
+                        Ok(SecretSource::env(var))
+                    })
+                    .transpose()?;
+                builder.proxy(move |p| {
+                    let proxy = p.socks5(address);
+                    match (username, password) {
+                        (Some(username), Some(password)) => proxy.credentials(username, password),
+                        _ => proxy,
+                    }
+                })
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unsupported outbound proxy protocol {protocol:?}"
+                )));
+            }
+        };
+    }
+
     // Secrets.
     if let Some(secrets) = kwargs.get_item("secrets")?.filter(|v| !v.is_none()) {
         let secrets_iter = secrets.try_iter().map_err(|_| {
@@ -806,6 +870,8 @@ fn apply_mount(
     let host_perms = extract_opt::<String>(mount, "host_permissions")?
         .map(parse_host_perms)
         .transpose()?;
+    let override_uid = extract_opt::<u32>(mount, "override_uid")?;
+    let override_gid = extract_opt::<u32>(mount, "override_gid")?;
 
     if let Some(bind_path) = extract_opt::<String>(mount, "bind")? {
         let quota_mib = extract_opt::<u32>(mount, "quota_mib")?;
@@ -828,6 +894,9 @@ fn apply_mount(
             }
             if let Some(p) = host_perms {
                 m = m.host_permissions(p);
+            }
+            if let (Some(uid), Some(gid)) = (override_uid, override_gid) {
+                m = m.owner(uid, gid);
             }
             if let Some(quota_mib) = quota_mib {
                 m = m.quota(quota_mib);
@@ -889,6 +958,9 @@ fn apply_mount(
             }
             if let Some(p) = host_perms {
                 m = m.host_permissions(p);
+            }
+            if let (Some(uid), Some(gid)) = (override_uid, override_gid) {
+                m = m.owner(uid, gid);
             }
             m
         }))
@@ -1258,6 +1330,11 @@ fn apply_network(
     // Max connections.
     if let Some(max) = extract_opt::<usize>(net, "max_connections")? {
         builder = builder.network(|n| n.max_connections(max));
+    }
+
+    // Strict hostname policy.
+    if let Some(strict) = extract_opt::<bool>(net, "strict")? {
+        builder = builder.network(move |n| n.strict(strict));
     }
 
     // Rate limiters (egress = guest -> runtime, ingress = runtime -> guest).

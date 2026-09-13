@@ -59,6 +59,20 @@ pub enum MicrosandboxError {
     #[error("sandbox already exists: {0}")]
     SandboxAlreadyExists(String),
 
+    /// A receiver was bound to an older sandbox that has since been replaced
+    /// by another sandbox using the same name.
+    #[error(
+        "sandbox {name:?} was replaced (expected identity {expected}, found {actual}); refusing stale lifecycle operation"
+    )]
+    SandboxReplaced {
+        /// Reused sandbox name.
+        name: String,
+        /// Identity captured by the receiver.
+        expected: String,
+        /// Identity currently associated with the name.
+        actual: String,
+    },
+
     /// The sandbox is still running and cannot be removed.
     #[error("sandbox still running: {0}")]
     SandboxStillRunning(String),
@@ -267,6 +281,8 @@ pub enum Operation {
     SandboxLogStreamNoFollow,
     /// `Sandbox::log_stream` with `follow: true`.
     SandboxLogStreamFollow,
+    /// `Sandbox::follow_logs`.
+    SandboxFollowLogs,
     /// `Sandbox::logger`.
     SandboxLogger,
     /// `Sandbox::metrics`.
@@ -421,6 +437,7 @@ impl Operation {
             Operation::SandboxLogStream => "Sandbox::log_stream",
             Operation::SandboxLogStreamNoFollow => "Sandbox::log_stream(follow=false)",
             Operation::SandboxLogStreamFollow => "Sandbox::log_stream(follow=true)",
+            Operation::SandboxFollowLogs => "Sandbox::follow_logs",
             Operation::SandboxLogger => "Sandbox::logger",
             Operation::SandboxMetrics => "Sandbox::metrics",
             Operation::SandboxMetricsStream => "Sandbox::metrics_stream",

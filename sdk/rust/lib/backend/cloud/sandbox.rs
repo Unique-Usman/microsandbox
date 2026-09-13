@@ -10,10 +10,10 @@ use futures::future::BoxFuture;
 use super::CloudBackend;
 use crate::backend::{
     Backend,
-    sandbox::{LogStream, MetricsStream, SandboxBackend},
+    sandbox::{LogStream, MetricsStream, SandboxBackend, SandboxIdentity},
 };
 use crate::error::{Operation, UnsupportedReason};
-use crate::logs::{LogEntry, LogOptions, LogStreamOptions};
+use crate::logs::{BootError, LogEntry, LogOptions, LogStreamOptions};
 use crate::sandbox::metrics::SandboxMetrics;
 use crate::sandbox::{
     RootfsSource, Sandbox, SandboxConfig, SandboxHandle, SandboxListBuilder, SandboxPage,
@@ -132,6 +132,31 @@ impl SandboxBackend for CloudBackend {
         })
     }
 
+    fn start_identified<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        _name: &'a str,
+        identity: SandboxIdentity,
+    ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
+        Box::pin(async move {
+            let id = cloud_identity(identity)?;
+            let current = CloudBackend::get_sandbox_by_id(self, &id).await?;
+            let config = sandbox_config_from_cloud(&current);
+            let cloud = CloudBackend::start_sandbox_by_id(self, &id).await?;
+            ensure_cloud_sandbox_ready(&cloud)?;
+            Ok(Sandbox::from_cloud(backend, cloud, config))
+        })
+    }
+
+    fn start_detached_identified<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+        identity: SandboxIdentity,
+    ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
+        self.start_identified(backend, name, identity)
+    }
+
     fn get<'a>(
         &'a self,
         backend: Arc<dyn Backend>,
@@ -173,6 +198,18 @@ impl SandboxBackend for CloudBackend {
         })
     }
 
+    fn remove_identified<'a>(
+        &'a self,
+        _backend: Arc<dyn Backend>,
+        _name: &'a str,
+        identity: SandboxIdentity,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move {
+            CloudBackend::destroy_sandbox_by_id(self, &cloud_identity(identity)?).await?;
+            Ok(())
+        })
+    }
+
     fn stop<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
@@ -180,6 +217,18 @@ impl SandboxBackend for CloudBackend {
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move {
             CloudBackend::stop_sandbox(self, name).await?;
+            Ok(())
+        })
+    }
+
+    fn stop_identified<'a>(
+        &'a self,
+        _backend: Arc<dyn Backend>,
+        _name: &'a str,
+        identity: SandboxIdentity,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move {
+            CloudBackend::stop_sandbox_by_id(self, &cloud_identity(identity)?).await?;
             Ok(())
         })
     }
@@ -210,6 +259,16 @@ impl SandboxBackend for CloudBackend {
         })
     }
 
+    fn boot_error<'a>(
+        &'a self,
+        _backend: Arc<dyn Backend>,
+        _name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<Option<BootError>>> {
+        // The cloud API does not currently expose a boot-error concept. Keep
+        // the optional backend contract so it can provide one in the future.
+        Box::pin(async { Ok(None) })
+    }
+
     fn logs<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
@@ -226,6 +285,30 @@ impl SandboxBackend for CloudBackend {
         opts: &'a LogStreamOptions,
     ) -> BoxFuture<'a, MicrosandboxResult<LogStream>> {
         Box::pin(async move { CloudBackend::log_stream(self, name, opts).await })
+    }
+
+    fn follow_logs<'a>(
+        &'a self,
+        _backend: Arc<dyn Backend>,
+        name: &'a str,
+        opts: &'a LogOptions,
+    ) -> BoxFuture<'a, MicrosandboxResult<LogStream>> {
+        Box::pin(async move {
+            if opts.tail.is_some() || opts.since.is_some() || opts.until.is_some() {
+                return Err(MicrosandboxError::unsupported(
+                    Operation::SandboxFollowLogs,
+                    UnsupportedReason::NotAvailable(
+                        "bounded cloud log follow filters are not yet available".to_string(),
+                    ),
+                ));
+            }
+            let stream_opts = LogStreamOptions {
+                sources: opts.sources.clone(),
+                follow: true,
+                ..Default::default()
+            };
+            CloudBackend::log_stream(self, name, &stream_opts).await
+        })
     }
 
     fn metrics<'a>(
@@ -358,6 +441,15 @@ impl TryFrom<SandboxConfig> for CloudCreateBody {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+fn cloud_identity(identity: SandboxIdentity) -> MicrosandboxResult<String> {
+    match identity {
+        SandboxIdentity::Cloud(id) => Ok(id),
+        SandboxIdentity::Local(id) => Err(MicrosandboxError::Runtime(format!(
+            "local sandbox identity {id} was routed to the cloud backend"
+        ))),
+    }
+}
+
 fn cloud_create_body_and_config(
     mut config: SandboxConfig,
 ) -> MicrosandboxResult<(CloudCreateBody, SandboxConfig)> {
@@ -419,6 +511,9 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
     if config.spec.network.rate_limiter.is_some() {
         return Err(unsupported("network.rate_limiter"));
     }
+    if config.spec.network.outbound_proxy.is_some() {
+        return Err(unsupported("network.outbound_proxy"));
+    }
 
     if config
         .spec
@@ -427,6 +522,20 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
         .any(|mount| mount.named_create().is_some())
     {
         return Err(unsupported("named volume inline create"));
+    }
+    if config.spec.mounts.iter().any(|mount| {
+        let options = match mount {
+            microsandbox_types::VolumeMount::Bind { options, .. }
+            | microsandbox_types::VolumeMount::Named { options, .. }
+            | microsandbox_types::VolumeMount::Tmpfs { options, .. }
+            | microsandbox_types::VolumeMount::DiskImage { options, .. } => options,
+        };
+        options.override_uid.is_some() || options.override_gid.is_some()
+    }) {
+        // Mount ownership is currently a local host-filesystem presentation
+        // policy. Until the cloud control plane advertises this capability,
+        // sending it would let older servers silently ignore access semantics.
+        return Err(unsupported("mount owner"));
     }
 
     if config.snapshot_upper_source.is_some() {
@@ -552,13 +661,67 @@ pub(crate) fn sandbox_config_from_cloud_spec(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use microsandbox_types::{
         CloudSandboxSpec, HostPermissions, MountOptions, NamedVolumeCreate, NamedVolumeMode,
         StatVirtualization, VolumeKind, VolumeMount,
     };
 
     use super::*;
+    use crate::backend::{Backend, SandboxBackend};
     use crate::sandbox::{EnvVar, OciRootfsSource, RootDisk, SandboxBuilder, SandboxSpec};
+
+    #[tokio::test]
+    async fn cloud_boot_error_is_absent_until_the_api_exposes_diagnostics() {
+        let backend = Arc::new(CloudBackend::new("http://127.0.0.1:1", "test-key").unwrap());
+        let backend_dyn: Arc<dyn Backend> = backend.clone();
+
+        let boot_error = backend
+            .boot_error(backend_dyn, "cloud-sandbox")
+            .await
+            .unwrap();
+
+        assert!(boot_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn cloud_follow_logs_rejects_bounded_filters_before_opening_stream() {
+        let backend = Arc::new(CloudBackend::new("http://127.0.0.1:1", "test-key").unwrap());
+        let now = chrono::Utc::now();
+
+        for opts in [
+            LogOptions {
+                tail: Some(10),
+                ..Default::default()
+            },
+            LogOptions {
+                since: Some(now),
+                ..Default::default()
+            },
+            LogOptions {
+                until: Some(now),
+                ..Default::default()
+            },
+        ] {
+            let backend_dyn: Arc<dyn Backend> = backend.clone();
+            let error = match backend
+                .follow_logs(backend_dyn, "cloud-sandbox", &opts)
+                .await
+            {
+                Ok(_) => panic!("bounded cloud follow should be unsupported"),
+                Err(error) => error,
+            };
+
+            assert!(matches!(
+                error,
+                MicrosandboxError::Unsupported {
+                    op: Operation::SandboxFollowLogs,
+                    reason: UnsupportedReason::NotAvailable(ref reason),
+                } if reason == "bounded cloud log follow filters are not yet available"
+            ));
+        }
+    }
 
     #[tokio::test]
     async fn cloud_create_request_maps_common_fields() {
@@ -915,6 +1078,26 @@ mod tests {
     }
 
     #[test]
+    fn cloud_create_request_rejects_mount_owner_without_capability() {
+        let mut config = base_cloud_config();
+        config.spec.mounts.push(VolumeMount::Bind {
+            host: "/host/data".into(),
+            guest: "/data".into(),
+            options: MountOptions {
+                override_uid: Some(1000),
+                override_gid: Some(1000),
+                ..MountOptions::default()
+            },
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+        });
+
+        assert_unsupported_config_field(config, "mount owner");
+    }
+
+    #[test]
     fn cloud_create_request_accepts_harmless_omitted_defaults() {
         let mut config = base_cloud_config();
         config.spec.resources.cpus = 2;
@@ -1000,6 +1183,18 @@ mod tests {
         });
         let err = CloudCreateBody::try_from(config).unwrap_err();
         assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn cloud_create_request_rejects_outbound_proxy() {
+        let mut config = base_cloud_config();
+        config.spec.network.outbound_proxy = Some(microsandbox_types::OutboundProxy::Socks5 {
+            address: "127.0.0.1:1080".to_string(),
+            credentials: None,
+        });
+
+        assert_unsupported_config_field(config, "network.outbound_proxy");
     }
 
     #[test]
