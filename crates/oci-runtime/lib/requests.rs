@@ -199,6 +199,12 @@ pub(crate) async fn stop_sandbox_for_delete(id: &str) -> Result<()> {
         return Ok(());
     }
 
+    if refreshed.status_snapshot() == SandboxStatus::Paused {
+        return refreshed.kill().await.with_context(|| {
+            format!("kill paused Microsandbox sandbox `{name}` during force delete")
+        });
+    }
+
     refreshed
         .stop()
         .await

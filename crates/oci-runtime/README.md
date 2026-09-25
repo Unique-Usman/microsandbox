@@ -7,7 +7,7 @@ Microsandbox's existing libkrun microVM and `agentd` process APIs to the OCI lif
 Docker and containerd.
 
 The patch demonstrates that basic Docker workloads can run through Microsandbox, but it is not yet
-a complete OCI implementation. In particular, pause/resume, hooks, cgroups, security policies, and
+a complete OCI implementation. In particular, hooks, cgroups, security policies, and
 complete Docker networking are still missing. This report describes the implementation, its current
 limits, and the decisions that need maintainer agreement before the runtime becomes supported.
 
@@ -120,7 +120,7 @@ Microsandbox sandbox and runtime-owned state only.
 | `kill` | Signal the guest init session through `agentd` when it exists; killing a created-but-not-started container stops the VMM instead of queuing stale work. `--all` is unsupported. |
 | `state` | Reconcile and print OCI-compatible persisted state. |
 | `delete` | Stop/remove the sandbox when allowed and remove runtime-owned state. |
-| `pause` / `resume` | Parsed for compatibility but return explicit not-implemented errors. |
+| `pause` / `resume` | Suspend and resume the resident VM using Microsandbox's host control endpoint. Save OCI state after the VMM confirms the transition. |
 
 The default state root is `/run/runmsb`:
 
@@ -262,7 +262,11 @@ implements the runc-style command surface it expects.
 - OCI hooks are not executed.
 - Cgroups and resource updates are not implemented.
 - Capabilities, seccomp, AppArmor, SELinux, and complete namespace semantics are not applied.
-- `pause`, `resume`, `kill --all`, `update`, and checkpoint/restore are unsupported.
+- `kill --all`, `update`, and checkpoint/restore are unsupported.
+- Pause/resume suspends the whole VM while retaining its RAM and host PID. It uses the
+  existing Microsandbox pause implementation, not a new OCI cgroup freezer. State queries
+  reconcile suspension through host control without connecting to the suspended guest.
+  Force deletion of a paused container kills the VM through the host SDK.
 - Command-style `exec` is incomplete; process-file and detached `exec` are supported.
 - Non-TTY attached stdin (`docker run -i` without `-t`) needs explicit OCI file-descriptor support.
 - Docker bridge networking and published ports are incomplete.
@@ -287,7 +291,7 @@ without applying its semantics must not be presented as security or OCI complian
    accepted OCI milestone?
 4. Is the VMM-as-host-PID model acceptable, and should networking continue through the existing
    userspace virtio-net backend?
-5. Should pause freeze guest processes, suspend the VM, or combine both mechanisms?
+5. Is resident whole-VM pause the desired long-term Docker pause behavior?
 6. Is one OCI container per VM the intended long-term policy?
 7. Is a native containerd shim in scope for this project?
 8. What test threshold is required before the runtime is no longer experimental?
@@ -455,12 +459,18 @@ docker rm msb-sleep
 
 The expected wait and inspect exit code after SIGTERM is `143`.
 
-Known unsupported pause behavior:
+Pause and resume the same VM:
 
 ```bash
 docker run -d --name msb-pause --runtime runmsb ubuntu:latest sleep 300
 docker pause msb-pause
+docker inspect -f '{{.State.Paused}} {{.State.Pid}}' msb-pause
+docker unpause msb-pause
+docker inspect -f '{{.State.Paused}} {{.State.Pid}}' msb-pause
+docker exec msb-pause /bin/sh -c 'echo RESUMED'
+docker pause msb-pause
 docker rm -f msb-pause
 ```
 
-`docker pause` is currently expected to report that pause is not implemented.
+The first inspection should show `true`, the second `false`, with the same host PID.
+Exec should print `RESUMED`. The final removal checks cleanup while the VM is paused.

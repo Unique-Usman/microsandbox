@@ -6,7 +6,8 @@ use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use microsandbox::sandbox::{Sandbox, SandboxStatus};
 use microsandbox_runtime::oci::{
-    OciBundle, OciOperation, OciState, OciStateStore, next_status, sandbox_name_for_container,
+    OciBundle, OciOperation, OciState, OciStateStore, OciStatus, next_status,
+    sandbox_name_for_container,
 };
 
 use crate::console::open_console_bridge;
@@ -143,6 +144,12 @@ impl MicrosandboxOciRuntime {
 
         let signal = parse_signal(&options.signal)?;
         let mut state = state;
+        if state.status == OciStatus::Paused && signal == libc::SIGKILL {
+            stop_sandbox_for_delete(&options.id).await?;
+            state.mark_stopped(Some(128 + signal), Utc::now());
+            self.store.save(&state)?;
+            return Ok(());
+        }
         if state
             .microsandbox
             .as_ref()
@@ -178,7 +185,9 @@ impl MicrosandboxOciRuntime {
     pub async fn delete(&self, options: DeleteOptions) -> Result<()> {
         let mut state = self.store.load(&options.id)?;
         if options.force && !state.status.is_terminal() {
-            signal_init_process_if_known(&options.id, &state, libc::SIGKILL).await?;
+            if state.status != OciStatus::Paused {
+                signal_init_process_if_known(&options.id, &state, libc::SIGKILL).await?;
+            }
             stop_sandbox_for_delete(&options.id).await?;
             state.mark_stopped(None, Utc::now());
             self.store.save(&state)?;
@@ -221,22 +230,56 @@ impl MicrosandboxOciRuntime {
                 state.mark_stopped(None, Utc::now());
                 self.store.save(&state)?;
             }
+            if matches!(state.status, OciStatus::Running | OciStatus::Paused) {
+                let pause = handle.pause_state().await?;
+                state.status = if pause.paused || pause.recovery_required {
+                    OciStatus::Paused
+                } else {
+                    OciStatus::Running
+                };
+                self.store.save(&state)?;
+            }
         }
         Ok(state)
     }
 
-    /// Pause the OCI container if Microsandbox has a matching backend state.
+    /// Suspend the resident VM through its host control endpoint.
     pub async fn pause(&self, id: &str) -> Result<()> {
-        let state = self.store.load(id)?;
-        let _ = next_status(OciOperation::Pause, &state)?;
-        bail!("pause is not implemented by runmsb yet")
+        self.change_pause_state(id, OciOperation::Pause, async {
+            Sandbox::get_for_control(&sandbox_name_for_container(id))
+                .await?
+                .pause()
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
-    /// Resume the OCI container if Microsandbox has a matching backend state.
+    /// Resume the same VM and guest processes through host control.
     pub async fn resume(&self, id: &str) -> Result<()> {
-        let state = self.store.load(id)?;
-        let _ = next_status(OciOperation::Resume, &state)?;
-        bail!("resume is not implemented by runmsb yet")
+        self.change_pause_state(id, OciOperation::Resume, async {
+            Sandbox::get_for_control(&sandbox_name_for_container(id))
+                .await?
+                .resume()
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn change_pause_state(
+        &self,
+        id: &str,
+        operation: OciOperation,
+        request: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
+        let mut state = self.store.load(id)?;
+        let status = next_status(operation, &state)?;
+        // The SDK checks the VMM acknowledgement before we persist the transition.
+        request.await?;
+        state.status = status;
+        self.store.save(&state)?;
+        Ok(())
     }
 
     async fn exec_with_console(
@@ -268,5 +311,97 @@ impl MicrosandboxOciRuntime {
         .await?;
         sandbox.detach().await;
         Ok(exit_code)
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use microsandbox_runtime::oci::MicrosandboxState;
+
+    use super::*;
+
+    fn runtime_with_state(root: &std::path::Path, status: OciStatus) -> MicrosandboxOciRuntime {
+        let runtime = MicrosandboxOciRuntime::new(root);
+        let mut state = OciState::created(
+            "pause-test",
+            "1.2.0",
+            "/bundle",
+            BTreeMap::new(),
+            MicrosandboxState::new("oci-pause-test", root, "/rootfs", Utc::now()),
+        );
+        state.status = status;
+        state.pid = Some(1234);
+        std::fs::create_dir_all(runtime.store.container_dir(&state.id).unwrap()).unwrap();
+        runtime.store.save(&state).unwrap();
+        runtime
+    }
+
+    #[tokio::test]
+    async fn pause_resume_persist_only_after_acknowledgement() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_state(root.path(), OciStatus::Running);
+        for (operation, before, after) in [
+            (OciOperation::Pause, OciStatus::Running, OciStatus::Paused),
+            (OciOperation::Resume, OciStatus::Paused, OciStatus::Running),
+        ] {
+            runtime
+                .change_pause_state("pause-test", operation, async {
+                    assert_eq!(runtime.store.load("pause-test")?.status, before);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let state = runtime.store.load("pause-test").unwrap();
+            assert_eq!(state.status, after);
+            assert_eq!(state.pid, Some(1234));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_host_requests_preserve_state() {
+        for (operation, status) in [
+            (OciOperation::Pause, OciStatus::Running),
+            (OciOperation::Resume, OciStatus::Paused),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = runtime_with_state(root.path(), status);
+            let before = runtime.store.load("pause-test").unwrap();
+            let error = runtime
+                .change_pause_state("pause-test", operation, async {
+                    bail!("VMM rejected transition")
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("VMM rejected"));
+            assert_eq!(runtime.store.load("pause-test").unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_transitions_do_not_contact_vmm() {
+        for (operation, status) in [
+            (OciOperation::Pause, OciStatus::Created),
+            (OciOperation::Pause, OciStatus::Paused),
+            (OciOperation::Resume, OciStatus::Running),
+            (OciOperation::Resume, OciStatus::Stopped),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = runtime_with_state(root.path(), status);
+            assert!(
+                runtime
+                    .change_pause_state("pause-test", operation, async {
+                        panic!("invalid transition must not contact VMM")
+                    })
+                    .await
+                    .is_err()
+            );
+            assert_eq!(runtime.store.load("pause-test").unwrap().status, status);
+        }
     }
 }
