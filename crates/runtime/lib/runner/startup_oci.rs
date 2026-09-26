@@ -5,7 +5,9 @@ use std::io::{ErrorKind, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 
-use microsandbox_agent_client::{AgentClient, TypedMessage};
+use microsandbox_agent_client::{
+    AgentClient, ClientResult, ErrorKind as ClientErrorKind, TypedMessage,
+};
 use microsandbox_protocol::{
     exec::{
         ExecExited, ExecFailed, ExecRequest, ExecResize, ExecSignal, ExecStderr, ExecStdin,
@@ -222,15 +224,13 @@ async fn run_startup_command_inner(
                             write_session_id(&path, id)?;
                         }
                         if let Some(payload) = initial_stdin.take() {
-                            client
+                            let result = client
                                 .send(
                                     id,
                                     TypedMessage::new(MessageType::ExecStdin, &payload),
                                 )
-                                .await
-                                .map_err(|err| RuntimeError::Custom(format!(
-                                    "startup command close stdin: {err}"
-                                )))?;
+                                .await;
+                            check_initial_stdin_delivery(result)?;
                         }
                     }
                     Some(MessageType::ExecStdout) => {
@@ -472,6 +472,21 @@ fn set_nonblocking(fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
+fn check_initial_stdin_delivery(result: ClientResult<()>) -> RuntimeResult<()> {
+    match result {
+        // A fast process may already have a terminal event buffered in the receiver.
+        // Continue draining that stream so its output and exit status are preserved.
+        Ok(())
+        | Err(microsandbox_agent_client::ClientError {
+            kind: ClientErrorKind::StreamClosed,
+            ..
+        }) => Ok(()),
+        Err(error) => Err(RuntimeError::Custom(format!(
+            "startup command close stdin: {error}"
+        ))),
+    }
+}
+
 fn write_session_id(path: &Path, id: u32) -> RuntimeResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -558,6 +573,29 @@ fn take_signal_request(path: &Path) -> RuntimeResult<Option<i32>> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    use microsandbox_agent_client::{ClientError, ErrorKind};
+
+    #[test]
+    fn stdin_eof_racing_with_exit_keeps_receiving_terminal_event() {
+        assert!(super::check_initial_stdin_delivery(Ok(())).is_ok());
+        assert!(
+            super::check_initial_stdin_delivery(Err(ClientError::new(ErrorKind::StreamClosed,)))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn stdin_eof_transport_errors_remain_fatal() {
+        for kind in [
+            ErrorKind::Timeout,
+            ErrorKind::Io(std::io::ErrorKind::BrokenPipe),
+        ] {
+            let error = super::check_initial_stdin_delivery(Err(ClientError::new(kind)))
+                .expect_err("transport failure must remain visible");
+            assert!(error.to_string().contains("startup command close stdin"));
+        }
+    }
 
     #[test]
     fn takes_signal_request_once() {

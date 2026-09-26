@@ -267,6 +267,9 @@ implements the runc-style command surface it expects.
   existing Microsandbox pause implementation, not a new OCI cgroup freezer. State queries
   reconcile suspension through host control without connecting to the suspended guest.
   Force deletion of a paused container kills the VM through the host SDK.
+  The guest kernel must advertise clock-only resume support. Older firmware can
+  boot containers but rejects pause/resume; use firmware built from the matching
+  Microsandbox vendor revision and recreate the VM after upgrading it.
 - Command-style `exec` is incomplete; process-file and detached `exec` are supported.
 - Non-TTY attached stdin (`docker run -i` without `-t`) needs explicit OCI file-descriptor support.
 - Docker bridge networking and published ports are incomplete.
