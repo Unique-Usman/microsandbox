@@ -9,15 +9,7 @@ pub(crate) fn oci_features_json() -> serde_json::Value {
         "ociVersionMin": "1.0.0",
         "ociVersionMax": "1.2.0",
         "hooks": [],
-        "mountOptions": [
-            "bind",
-            "rbind",
-            "ro",
-            "rw",
-            "nosuid",
-            "nodev",
-            "noexec"
-        ],
+        "mountOptions": [],
         "linux": {
             "namespaces": [],
             "capabilities": [],
@@ -60,12 +52,7 @@ mod tests {
         assert_eq!(features["ociVersionMin"], "1.0.0");
         assert_eq!(features["ociVersionMax"], "1.2.0");
         assert!(features["hooks"].is_array());
-        assert!(
-            features["mountOptions"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::Value::String("rbind".to_string()))
-        );
+        assert!(features["mountOptions"].as_array().unwrap().is_empty());
         assert_eq!(features["linux"]["seccomp"]["enabled"], false);
         assert_eq!(
             features["annotations"]["org.opencontainers.runmsb.version"],

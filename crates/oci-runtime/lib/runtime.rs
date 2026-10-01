@@ -18,8 +18,8 @@ use crate::process::{
 };
 use crate::requests::{
     OCI_SIGNAL_REQUEST, OCI_START_REQUEST, ensure_vmm_process_alive, publish_signal_request,
-    publish_start_request, read_init_session_id, signal_init_process_if_known,
-    stop_sandbox_for_delete, wait_for_init_exit, wait_for_init_session_id,
+    publish_start_request, read_init_session_id, stop_sandbox_for_delete, wait_for_init_exit,
+    wait_for_init_session_id,
 };
 use crate::sandbox::{
     create_sandbox_for_bundle, requires_fresh_network_namespace, resolve_created_sandbox_host_pid,
@@ -50,19 +50,45 @@ impl MicrosandboxOciRuntime {
 
     /// Create the Microsandbox-backed OCI container environment.
     pub async fn create(&self, options: CreateOptions) -> Result<()> {
-        let bundle = OciBundle::load(&options.bundle)?;
+        let mut bundle = OciBundle::load(&options.bundle)?;
+        let raw = std::fs::read(bundle.path.join("config.json"))?;
+        crate::validation::validate_bundle(&serde_json::from_slice(&raw)?)?;
+        bundle.spec = serde_json::from_slice(&raw)?;
+        bundle.validate()?;
+        if bundle
+            .process()
+            .is_some_and(|process| process.terminal() == Some(true))
+            && options.console.is_none()
+        {
+            bail!("terminal process requires an OCI console socket");
+        }
+        let _lock = crate::lock::acquire(&self.store, &options.id).await?;
         let mut state = self.store.create_created(&options.id, &bundle)?;
 
         let state_dir = self.store.container_dir(&options.id)?;
-        let sandbox =
-            create_sandbox_for_bundle(&options.id, &bundle, &state_dir, options.console).await?;
-        if let Some(pid) = resolve_created_sandbox_host_pid(&options.id, &sandbox).await {
-            state.pid = Some(pid);
+        let result: Result<()> = async {
+            let sandbox =
+                create_sandbox_for_bundle(&options.id, &bundle, &state_dir, options.console)
+                    .await?;
+            state.pid = Some(
+                resolve_created_sandbox_host_pid(&options.id, &sandbox)
+                    .await
+                    .ok_or_else(|| anyhow!("container has no VMM host PID"))?,
+            );
+            self.store.save(&state)?;
+            sandbox.detach().await;
+            Ok(())
         }
-        self.store.save(&state)?;
-
-        sandbox.detach().await;
-        Ok(())
+        .await;
+        if result.is_err() {
+            // Retain state if teardown fails: never hide a potentially live VM.
+            stop_sandbox_for_delete(&options.id).await?;
+            if let Ok(handle) = Sandbox::get(&sandbox_name_for_container(&options.id)).await {
+                handle.remove().await?;
+            }
+            self.store.delete(&options.id)?;
+        }
+        result
     }
 
     /// Record the host process PID Docker/containerd should track for the OCI container.
@@ -82,6 +108,7 @@ impl MicrosandboxOciRuntime {
 
     /// Start the configured OCI init process.
     pub async fn start(&self, id: &str) -> Result<()> {
+        let _lock = crate::lock::acquire(&self.store, id).await?;
         let mut state = self.store.load(id)?;
         OciOperation::Start.validate(&state)?;
 
@@ -139,12 +166,26 @@ impl MicrosandboxOciRuntime {
 
     /// Send a signal to the OCI init process inside the guest.
     pub async fn kill(&self, options: KillOptions) -> Result<()> {
-        let state = self.store.load(&options.id)?;
-        OciOperation::Kill.validate(&state)?;
-
+        if options.all {
+            bail!("kill --all is not implemented");
+        }
+        let _lock = crate::lock::acquire(&self.store, &options.id).await?;
         let signal = parse_signal(&options.signal)?;
+        let state = if signal == 0 || signal == libc::SIGKILL {
+            self.store.load(&options.id)?
+        } else {
+            self.state(&options.id).await?
+        };
+        OciOperation::Kill.validate(&state)?;
+        let pid = state
+            .pid
+            .ok_or_else(|| anyhow!("container has no VMM host PID"))?;
+        ensure_vmm_process_alive(&options.id, pid)?;
+        if signal == 0 {
+            return Ok(());
+        }
         let mut state = state;
-        if state.status == OciStatus::Paused && signal == libc::SIGKILL {
+        if signal == libc::SIGKILL {
             stop_sandbox_for_delete(&options.id).await?;
             state.mark_stopped(Some(128 + signal), Utc::now());
             self.store.save(&state)?;
@@ -183,11 +224,13 @@ impl MicrosandboxOciRuntime {
 
     /// Delete OCI and Microsandbox state.
     pub async fn delete(&self, options: DeleteOptions) -> Result<()> {
-        let mut state = self.store.load(&options.id)?;
-        if options.force && !state.status.is_terminal() {
-            if state.status != OciStatus::Paused {
-                signal_init_process_if_known(&options.id, &state, libc::SIGKILL).await?;
-            }
+        let _lock = crate::lock::acquire(&self.store, &options.id).await?;
+        let mut state = if options.force {
+            self.store.load(&options.id)?
+        } else {
+            self.state(&options.id).await?
+        };
+        if options.force {
             stop_sandbox_for_delete(&options.id).await?;
             state.mark_stopped(None, Utc::now());
             self.store.save(&state)?;
@@ -216,6 +259,13 @@ impl MicrosandboxOciRuntime {
     /// Return OCI state, refreshing terminal status from Microsandbox when possible.
     pub async fn state(&self, id: &str) -> Result<OciState> {
         let mut state = self.store.load(id)?;
+        if state
+            .pid
+            .is_some_and(|pid| ensure_vmm_process_alive(id, pid).is_err())
+        {
+            state.mark_stopped(None, Utc::now());
+            return Ok(state);
+        }
         if let Ok(handle) = Sandbox::get(&sandbox_name_for_container(id)).await {
             if let Some(local) = handle.local()
                 && state.pid.is_none()
@@ -228,17 +278,33 @@ impl MicrosandboxOciRuntime {
             ) && !state.status.is_terminal()
             {
                 state.mark_stopped(None, Utc::now());
-                self.store.save(&state)?;
             }
             if matches!(state.status, OciStatus::Running | OciStatus::Paused) {
-                let pause = handle.pause_state().await?;
+                let pause = match handle.pause_state().await {
+                    Ok(pause) => pause,
+                    Err(_)
+                        if state
+                            .pid
+                            .is_some_and(|pid| ensure_vmm_process_alive(id, pid).is_err()) =>
+                    {
+                        state.mark_stopped(None, Utc::now());
+                        return Ok(state);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 state.status = if pause.paused || pause.recovery_required {
                     OciStatus::Paused
                 } else {
                     OciStatus::Running
                 };
-                self.store.save(&state)?;
             }
+        }
+        if state
+            .pid
+            .is_some_and(|pid| ensure_vmm_process_alive(id, pid).is_err())
+            && !state.status.is_terminal()
+        {
+            state.mark_stopped(None, Utc::now());
         }
         Ok(state)
     }
@@ -273,6 +339,7 @@ impl MicrosandboxOciRuntime {
         operation: OciOperation,
         request: impl std::future::Future<Output = Result<()>>,
     ) -> Result<()> {
+        let _lock = crate::lock::acquire(&self.store, id).await?;
         let mut state = self.store.load(id)?;
         let status = next_status(operation, &state)?;
         // The SDK checks the VMM acknowledgement before we persist the transition.
@@ -287,7 +354,7 @@ impl MicrosandboxOciRuntime {
         options: ExecOptions,
         console_slave: Option<PathBuf>,
     ) -> Result<i32> {
-        let state = self.store.load(&options.id)?;
+        let state = self.state(&options.id).await?;
         OciOperation::Exec.validate(&state)?;
         let mut host_signals = HostSignalForwarder::new()?;
 
@@ -295,22 +362,32 @@ impl MicrosandboxOciRuntime {
         let bundle = OciBundle::load(&state.bundle)?;
         let sandbox = crate::process::connect_sandbox(&options.id).await?;
         let (started, mut handle) =
-            start_process_stream(&sandbox, &process, &bundle.rootfs_path()).await?;
-        write_exec_pid_file(options.pid_file.as_deref(), &started)?;
+            match start_process_stream(&sandbox, &process, &bundle.rootfs_path()).await {
+                Ok(started) => started,
+                Err(error) => {
+                    sandbox.detach().await;
+                    return Err(error);
+                }
+            };
+        let result = async {
+            write_exec_pid_file(options.pid_file.as_deref(), &started)?;
 
-        let console = console_slave
-            .as_deref()
-            .map(open_console_bridge)
-            .transpose()?;
-        let exit_code = wait_for_process_exit(
-            &options.id,
-            &mut handle,
-            console.as_ref(),
-            &mut host_signals,
-        )
-        .await?;
+            let console = console_slave
+                .as_deref()
+                .map(open_console_bridge)
+                .transpose()?;
+            let exit_code = wait_for_process_exit(
+                &options.id,
+                &mut handle,
+                console.as_ref(),
+                &mut host_signals,
+            )
+            .await?;
+            Ok(exit_code)
+        }
+        .await;
         sandbox.detach().await;
-        Ok(exit_code)
+        result
     }
 }
 
@@ -340,6 +417,72 @@ mod tests {
         std::fs::create_dir_all(runtime.store.container_dir(&state.id).unwrap()).unwrap();
         runtime.store.save(&state).unwrap();
         runtime
+    }
+
+    #[tokio::test]
+    async fn dead_vmm_query_reports_stopped_without_overwriting_persisted_state() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_state(root.path(), OciStatus::Running);
+        let mut state = runtime.store.load("pause-test").unwrap();
+        state.pid = Some(i32::MAX);
+        runtime.store.save(&state).unwrap();
+        assert_eq!(
+            runtime.state("pause-test").await.unwrap().status,
+            OciStatus::Stopped
+        );
+        assert_eq!(runtime.store.load("pause-test").unwrap(), state);
+    }
+
+    #[tokio::test]
+    async fn unsupported_bundle_does_not_create_state() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        std::fs::create_dir(bundle.path().join("rootfs")).unwrap();
+        std::fs::write(
+            bundle.path().join("config.json"),
+            r#"{
+            "ociVersion":"1.2.0","root":{"path":"rootfs"},
+            "process":{"args":["/hello"],"cwd":"/","user":{"uid":0,"gid":0},"noNewPrivileges":true}
+        }"#,
+        )
+        .unwrap();
+        let runtime = MicrosandboxOciRuntime::new(root.path());
+        let error = runtime
+            .create(CreateOptions {
+                id: "rejected".into(),
+                bundle: bundle.path().into(),
+                console: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("noNewPrivileges"));
+        assert!(!root.path().join("rejected").exists());
+    }
+
+    #[tokio::test]
+    async fn signal_zero_preserves_created_container_and_queues_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_state(root.path(), OciStatus::Created);
+        let mut state = runtime.store.load("pause-test").unwrap();
+        state.pid = Some(std::process::id() as i32);
+        runtime.store.save(&state).unwrap();
+        runtime
+            .kill(KillOptions {
+                id: "pause-test".into(),
+                signal: "0".into(),
+                all: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(runtime.store.load("pause-test").unwrap(), state);
+        assert!(
+            !runtime
+                .store
+                .container_dir("pause-test")
+                .unwrap()
+                .join(OCI_SIGNAL_REQUEST)
+                .exists()
+        );
     }
 
     #[tokio::test]

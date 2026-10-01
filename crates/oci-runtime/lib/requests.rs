@@ -5,16 +5,12 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use microsandbox::sandbox::{Sandbox, SandboxStatus};
-use microsandbox_protocol::exec::ExecSignal;
-use microsandbox_protocol::message::MessageType;
-use microsandbox_runtime::oci::{OciState, OciStateStore, sandbox_name_for_container};
+use microsandbox_runtime::oci::{OciStateStore, sandbox_name_for_container};
 use nix::errno::Errno;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
-
-use crate::process::connect_sandbox;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -31,51 +27,6 @@ const OCI_START_TIMEOUT: Duration = Duration::from_secs(30);
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
-
-pub(crate) async fn signal_init_process(id: &str, state: &OciState, signal: i32) -> Result<()> {
-    let session_id = state
-        .microsandbox
-        .as_ref()
-        .and_then(|msb| msb.init_exec_session_id)
-        .ok_or_else(|| anyhow!("container `{id}` has no OCI init exec session to signal"))?;
-    let sandbox = connect_sandbox(id).await?;
-    let payload = ExecSignal { signal };
-
-    sandbox
-        .client_arc()
-        .send(session_id, MessageType::ExecSignal, &payload)
-        .await
-        .with_context(|| {
-            format!("send signal {signal} to OCI init exec session {session_id} for `{id}`")
-        })?;
-    sandbox.detach().await;
-    Ok(())
-}
-
-pub(crate) async fn signal_init_process_if_known(
-    id: &str,
-    state: &OciState,
-    signal: i32,
-) -> Result<()> {
-    if state
-        .microsandbox
-        .as_ref()
-        .and_then(|msb| msb.init_exec_session_id)
-        .is_none()
-    {
-        return Ok(());
-    }
-
-    if let Err(error) = signal_init_process(id, state, signal).await {
-        tracing::warn!(
-            container_id = id,
-            signal,
-            error = %error,
-            "failed to signal OCI init process during force delete; continuing with sandbox cleanup"
-        );
-    }
-    Ok(())
-}
 
 pub(crate) fn publish_start_request(path: &Path) -> Result<()> {
     fs::write(path, b"start").with_context(|| {
@@ -132,6 +83,13 @@ pub(crate) fn ensure_vmm_process_alive(id: &str, host_pid: i32) -> Result<()> {
     if host_pid <= 0 {
         bail!("container `{id}` has invalid Microsandbox VMM host PID {host_pid}");
     }
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{host_pid}/stat"))
+        && stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, fields)| fields.starts_with('Z') || fields.starts_with('X'))
+    {
+        bail!("Microsandbox VMM process {host_pid} for `{id}` exited before OCI init started");
+    }
 
     match kill(Pid::from_raw(host_pid), None) {
         Ok(()) | Err(Errno::EPERM) => Ok(()),
@@ -187,9 +145,17 @@ pub(crate) async fn wait_for_init_exit(store: &OciStateStore, id: &str) -> Resul
 }
 
 pub(crate) async fn stop_sandbox_for_delete(id: &str) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(15), stop_sandbox_for_delete_inner(id))
+        .await
+        .with_context(|| format!("timed out cleaning up sandbox `{id}`"))?
+}
+
+async fn stop_sandbox_for_delete_inner(id: &str) -> Result<()> {
     let name = sandbox_name_for_container(id);
-    let Ok(handle) = Sandbox::get(&name).await else {
-        return Ok(());
+    let handle = match Sandbox::get(&name).await {
+        Ok(handle) => handle,
+        Err(microsandbox::MicrosandboxError::SandboxNotFound(_)) => return Ok(()),
+        Err(error) => return Err(error.into()),
     };
     let refreshed = handle.refresh().await.unwrap_or(handle);
     if matches!(
@@ -199,16 +165,13 @@ pub(crate) async fn stop_sandbox_for_delete(id: &str) -> Result<()> {
         return Ok(());
     }
 
-    if refreshed.status_snapshot() == SandboxStatus::Paused {
-        return refreshed.kill().await.with_context(|| {
-            format!("kill paused Microsandbox sandbox `{name}` during force delete")
-        });
-    }
-
-    refreshed
-        .stop()
-        .await
-        .with_context(|| format!("stop Microsandbox sandbox `{name}` during force delete"))
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        refreshed.kill_with_timeout(Duration::from_secs(5)),
+    )
+    .await
+    .with_context(|| format!("timed out killing sandbox `{name}` during force delete"))?
+    .with_context(|| format!("kill Microsandbox sandbox `{name}` during force delete"))
 }
 
 fn read_init_session_error(store: &OciStateStore, id: &str) -> Result<Option<String>> {

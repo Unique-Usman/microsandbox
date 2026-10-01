@@ -2,6 +2,40 @@
 
 ## Overview
 
+### Strict support boundary
+
+`runmsb` now rejects OCI configuration fields whose semantics it cannot enforce,
+before allocating container state. This is a breaking change for ordinary Docker
+bundles: Docker normally supplies capabilities, namespaces, mounts, and resource
+settings that this runtime does not fully implement. Those bundles now fail
+explicitly, rather than launching with silently missing restrictions. The Docker
+examples below describe integration workflows and historical tests, not a claim
+that the strict build currently accepts Docker's default bundle.
+
+The accepted configuration subset is an OCI 1.0.x/1.1.0/1.2.0 bundle with a
+writable root, process args/environment/cwd, numeric UID/GID, and optional terminal
+dimensions. Annotations are metadata. Additional groups, capabilities, rlimits,
+no-new-privileges, security profiles, hooks, nonempty mounts, and nonempty Linux
+configuration (including network namespaces and cgroups) are rejected. Empty
+capability sets are also rejected: dropping every capability is an enforcement
+request, not a no-op. `--network none` must not silently fall back to host egress.
+Mount requests are rejected until their complete flags and host ownership
+semantics can be guaranteed. Feature reporting no longer advertises mount flags.
+
+Compatibility-only CLI switches remain accepted: `--systemd-cgroup`,
+`--cgroup-manager`, `--rootless`, `--no-pivot`, and `--no-new-keyring`. They do not
+claim implementation of cgroups, rootless execution, or host namespace controls.
+Zero `--preserve-fds` remains accepted; nonzero counts and `--pidfd-socket` request
+unimplemented descriptor handling and are rejected. Exec overrides not applied
+by the implementation are rejected, even alongside `--process`.
+
+Lifecycle mutations use per-container host file locks. State queries no longer
+write stale snapshots over pause/resume transitions. Delete reconciles VMM death,
+force delete uses bounded host-side termination, and signal zero only probes the
+VMM without writing a signal request. Exec must not restart a stopped VM. Its
+supervisor intentionally retains workload I/O until workload exit; redirecting
+non-terminal stdout/stderr to `/dev/null` would lose Docker exec output.
+
 This patch adds an experimental runc-compatible runtime named `runmsb`. It adapts
 Microsandbox's existing libkrun microVM and `agentd` process APIs to the OCI lifecycle expected by
 Docker and containerd.
@@ -271,7 +305,10 @@ implements the runc-style command surface it expects.
   boot containers but rejects pause/resume; use firmware built from the matching
   Microsandbox vendor revision and recreate the VM after upgrading it.
 - Command-style `exec` is incomplete; process-file and detached `exec` are supported.
-- Non-TTY attached stdin (`docker run -i` without `-t`) needs explicit OCI file-descriptor support.
+- Non-TTY stdin is inherited on descriptor 101, separate from the VMM console.
+  The startup supervisor forwards input after `ExecStarted` and sends EOF only
+  after the inherited input reaches EOF. Install matching `runmsb` and `msb`
+  builds when changing this descriptor contract.
 - Docker bridge networking and published ports are incomplete.
 - State/shim restart recovery has not been tested.
 - OCI runtime-tools and containerd conformance suites have not been added.

@@ -72,9 +72,6 @@ pub(crate) async fn connect_sandbox(id: &str) -> Result<Sandbox> {
         SandboxStatus::Running | SandboxStatus::Draining => {
             handle.connect().await.map_err(Into::into)
         }
-        SandboxStatus::Stopped | SandboxStatus::Crashed => {
-            handle.start_detached().await.map_err(Into::into)
-        }
         status => bail!("cannot connect to sandbox for container `{id}` while it is {status:?}"),
     }
 }
@@ -172,6 +169,7 @@ pub(crate) async fn forward_host_signal(control: &ExecControl, signal: i32) -> R
 pub(crate) fn load_process(path: &Path) -> Result<OciProcess> {
     let data = std::fs::read_to_string(path)
         .with_context(|| format!("read OCI process JSON `{}`", path.display()))?;
+    crate::validation::validate_process(&serde_json::from_str(&data)?)?;
     let process: OciProcess = serde_json::from_str(&data)
         .with_context(|| format!("parse OCI process JSON `{}`", path.display()))?;
     validate_process(&process, path.parent().unwrap_or_else(|| Path::new(".")))
@@ -210,7 +208,10 @@ pub(crate) fn env_pairs(env: &[String]) -> Result<Vec<(String, String)>> {
 
 pub(crate) fn parse_signal(signal: &str) -> Result<i32> {
     if let Ok(number) = signal.parse::<i32>() {
-        return Ok(number);
+        if (0..=64).contains(&number) {
+            return Ok(number);
+        }
+        bail!("invalid Linux signal number {number}");
     }
 
     let normalized = signal.trim_start_matches('-').to_ascii_uppercase();
@@ -331,6 +332,8 @@ mod tests {
         assert_eq!(parse_signal("WINCH").expect("winch"), libc::SIGWINCH);
         assert_eq!(parse_signal("-CONT").expect("cont"), libc::SIGCONT);
         assert!(parse_signal("SIGBOGUS").is_err());
+        assert!(parse_signal("-1").is_err());
+        assert!(parse_signal("65").is_err());
     }
 
     #[test]

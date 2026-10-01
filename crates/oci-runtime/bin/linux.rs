@@ -53,6 +53,7 @@ pub(crate) async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<i32> {
+    validate_command_options(&cli.command)?;
     let root = cli.root.clone();
     let runtime = MicrosandboxOciRuntime::new(root.clone());
     match cli.command {
@@ -195,6 +196,42 @@ async fn run(cli: Cli) -> Result<i32> {
     }
 }
 
+fn validate_command_options(command: &Command) -> Result<()> {
+    match command {
+        Command::Create(CreateCommand { options, .. })
+        | Command::Run(RunCommand { options, .. }) => {
+            if options.pidfd_socket.is_some() {
+                anyhow::bail!("--pidfd-socket is not implemented");
+            }
+            if options.preserve_fds != 0 {
+                anyhow::bail!("nonzero --preserve-fds is not implemented");
+            }
+        }
+        Command::Exec(options)
+            if options.pidfd_socket.is_some()
+                || options.preserve_fds != 0
+                || options.cwd.is_some()
+                || !options.env.is_empty()
+                || options.tty
+                || options.user.is_some()
+                || !options.additional_gids.is_empty()
+                || options.process_label.is_some()
+                || options.apparmor.is_some()
+                || options.no_new_privs
+                || !options.cap.is_empty()
+                || options.cgroup.is_some()
+                || options.ignore_paused
+                || !options.command.is_empty() =>
+        {
+            anyhow::bail!(
+                "unsupported exec overrides: use a supported --process JSON; security, cgroup, pidfd and preserved-fd overrides are not implemented"
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn write_pid_file(path: Option<&Path>, pid: i32) -> Result<()> {
     let Some(path) = path else {
         return Ok(());
@@ -264,8 +301,61 @@ async fn spawn_exec_supervisor(
         }
         if tokio::time::Instant::now() >= deadline {
             let _ = child.kill();
+            let _ = child.wait();
             anyhow::bail!("timed out waiting for OCI exec supervisor to start guest process");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_documented_compatibility_switches() {
+        let cli = Cli::try_parse_from([
+            "runmsb",
+            "--systemd-cgroup",
+            "--rootless",
+            "auto",
+            "--cgroup-manager",
+            "systemd",
+            "create",
+            "--no-pivot",
+            "--no-new-keyring",
+            "example",
+        ])
+        .unwrap();
+        validate_command_options(&cli.command).unwrap();
+    }
+
+    #[test]
+    fn rejects_unimplemented_exec_options_even_with_process_file() {
+        for option in ["--no-new-privs", "--ignore-paused", "--tty"] {
+            let cli = Cli::try_parse_from([
+                "runmsb",
+                "exec",
+                "--process",
+                "process.json",
+                option,
+                "example",
+            ])
+            .unwrap();
+            assert!(validate_command_options(&cli.command).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "runmsb",
+            "create",
+            "--pidfd-socket",
+            "/tmp/socket",
+            "example",
+        ])
+        .unwrap();
+        assert!(validate_command_options(&cli.command).is_err());
     }
 }
