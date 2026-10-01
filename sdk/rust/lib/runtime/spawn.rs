@@ -4917,10 +4917,12 @@ mod tests {
         assert!(!super::should_inherit_detached_stdio(&config));
         let startup = super::startup_command(&config).expect("startup command");
         assert!(startup.tty);
-        assert!(render_args(&config).contains(&format!(
-            "--oci-console-fd={}",
-            microsandbox_runtime::vm::OCI_CONSOLE_FD
-        )));
+        let args = render_args(&config);
+        let console_fd = microsandbox_runtime::vm::OCI_CONSOLE_FD.to_string();
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair[0] == "--oci-console-fd" && pair[1] == console_fd })
+        );
     }
 
     #[tokio::test]
