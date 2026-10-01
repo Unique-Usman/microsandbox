@@ -13,8 +13,8 @@ unsupported commands and CLI operations return explicit errors.
 Acceptance does not mean enforcement. Do not rely on OCI capabilities, seccomp,
 AppArmor/SELinux, no-new-privileges, cgroup limits, or full namespace isolation in
 this experimental runtime. VM isolation does not replace those requested
-controls. Docker network isolation (including `--network none`), read-only
-rootfs, and complete mount flags/ownership semantics also remain incomplete.
+controls. Full Docker bridge networking, read-only rootfs, and complete mount
+flags/ownership semantics also remain incomplete.
 Feature reporting does not advertise unimplemented controls or mount flags.
 
 OCI bind mounts select `HostPermissions::Mirror`: ordinary guest permission bits
@@ -258,6 +258,15 @@ be ignored: doing so lets a `--network none` container use the launcher's host r
 Joined namespaces retain automatic guest address selection from their routes. Only newly created
 namespaces use an explicit guest address pool while waiting for Docker to attach networking.
 
+For an OCI cold boot, packet processing waits until `start.request`. At that
+point the VMM checks its host namespace for an active, non-loopback interface
+with an IP address. If there is none, the userspace network stays inactive:
+the guest cannot obtain even a synthetic TCP connection from that backend.
+Guest loopback remains available. This covers both an empty joined namespace
+and a fresh namespace to which Docker has not attached a network interface.
+The check happens once; attaching a network later with `docker network connect`
+does not activate a container that started without networking.
+
 This removes the route conflict and preserves outbound Microsandbox networking, but it is not full
 Docker bridge integration. Docker's veth is not connected to the guest virtio-net backend, so
 published ports, user-defined networks, aliases, static addresses, and container-to-container
@@ -495,6 +504,17 @@ Outbound DNS/TCP, which does not prove Docker bridge or published-port support:
 docker run --rm --runtime runmsb python:3.12 \
   python -c "import socket; print(socket.getaddrinfo('example.com',80)[0][4][0]); s=socket.create_connection(('1.1.1.1',53),timeout=3); print('tcp_ok'); s.close()"
 ```
+
+No-network isolation (pull the image before applying the test timeout):
+
+```bash
+docker pull alpine:latest
+timeout 30 docker run --rm --runtime runmsb --network none alpine:latest \
+  sh -c 'if nc -z -w 2 1.1.1.1 53; then echo EGRESS_LEAK; exit 1; else echo ISOLATED_EGRESS_OK; fi'
+```
+
+Expect `ISOLATED_EGRESS_OK` and exit zero. Also run the outbound test above
+without `--network none` to check that ordinary networking still works.
 
 Detached lifecycle, exec, signal, and delete:
 

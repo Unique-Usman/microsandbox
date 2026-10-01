@@ -634,6 +634,8 @@ fn run(
     let startup_writer = startup_writer
         .map(|writer| failure_channel.retain(writer))
         .transpose()?;
+    #[cfg(feature = "net")]
+    let defer_network_until_start = defer_network_until_oci_start(&config);
     #[cfg(feature = "oci-runtime")]
     let startup_stdio = startup_stdio(&config)?;
     #[cfg(all(unix, feature = "oci-runtime"))]
@@ -1323,11 +1325,18 @@ fn run(
                     return;
                 }
                 #[cfg(feature = "net")]
-                if let Some(network_activation) = network_activation_handle {
+                let startup_network_activation = if defer_network_until_start {
+                    network_activation_handle
+                } else {
                     // Published-port listeners and all packet processing start only after the
                     // restored workload and local control surfaces are ready.
-                    network_activation.activate();
-                }
+                    if let Some(network_activation) = network_activation_handle {
+                        network_activation.activate();
+                    }
+                    None
+                };
+                #[cfg(all(feature = "net", not(feature = "oci-runtime")))]
+                let _ = startup_network_activation;
                 #[cfg(not(feature = "net"))]
                 let _ = network_activation_handle;
                 if let Some((
@@ -1376,6 +1385,8 @@ fn run(
                             startup_command,
                             startup_stdio,
                             startup_console,
+                            #[cfg(feature = "net")]
+                            startup_network_activation,
                         )
                         .await;
                         #[cfg(not(feature = "oci-runtime"))]
@@ -2618,7 +2629,7 @@ fn build_vm(
             network_secrets_handle = Some(network.secrets_handle());
         }
 
-        if vm.checkpoint_restore.is_some() {
+        if vm.checkpoint_restore.is_some() || defer_network_until_oci_start(config) {
             network_activation_handle = Some(network.defer_activation());
         }
 
@@ -2768,6 +2779,23 @@ fn build_vm(
         restored_agent,
         owned_directory_checkpoints,
     ))
+}
+
+#[cfg(feature = "net")]
+fn defer_network_until_oci_start(config: &Config) -> bool {
+    #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+    {
+        config.vm.checkpoint_restore.is_none()
+            && config
+                .startup_command
+                .as_ref()
+                .is_some_and(|command| command.start_signal_path.is_some())
+    }
+    #[cfg(not(all(target_os = "linux", feature = "oci-runtime")))]
+    {
+        let _ = config;
+        false
+    }
 }
 
 fn encode_bootstrap_frame(bootstrap: &GuestBootstrap) -> RuntimeResult<Vec<u8>> {

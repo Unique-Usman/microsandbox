@@ -8,6 +8,8 @@ use std::path::Path;
 use microsandbox_agent_client::{
     AgentClient, ClientResult, ErrorKind as ClientErrorKind, TypedMessage,
 };
+#[cfg(feature = "net")]
+use microsandbox_network::network::NetworkActivationHandle;
 use microsandbox_protocol::{
     exec::{
         ExecExited, ExecFailed, ExecRequest, ExecResize, ExecSignal, ExecStderr, ExecStdin,
@@ -80,10 +82,19 @@ pub(crate) async fn run_startup_command(
     command: StartupCommand,
     mut stdio: Option<StartupStdio>,
     console: Option<StartupConsole>,
+    #[cfg(feature = "net")] network_activation: Option<NetworkActivationHandle>,
 ) -> RuntimeResult<StartupCommandExit> {
     let error_path = command.session_id_path.as_deref().map(startup_error_path);
     let exit_path = command.session_id_path.as_deref().map(startup_exit_path);
-    let result = run_startup_command_inner(agent_sock_path, command, &mut stdio, console).await;
+    let result = run_startup_command_inner(
+        agent_sock_path,
+        command,
+        &mut stdio,
+        console,
+        #[cfg(feature = "net")]
+        network_activation,
+    )
+    .await;
 
     match &result {
         Err(error) => {
@@ -117,6 +128,7 @@ async fn run_startup_command_inner(
     command: StartupCommand,
     stdio: &mut Option<StartupStdio>,
     console: Option<StartupConsole>,
+    #[cfg(feature = "net")] network_activation: Option<NetworkActivationHandle>,
 ) -> RuntimeResult<StartupCommandExit> {
     let mut session_id_path = command.session_id_path;
     let signal_path = command.signal_path.clone();
@@ -132,6 +144,17 @@ async fn run_startup_command_inner(
     let mut console = open_startup_console(console)?;
     if let Some(start_signal_path) = command.start_signal_path.as_ref() {
         wait_for_start_signal(start_signal_path).await?;
+    }
+    #[cfg(feature = "net")]
+    if let Some(network_activation) = network_activation {
+        #[cfg(target_os = "linux")]
+        let connected = super::network_oci::namespace_has_network_interface()?;
+        #[cfg(not(target_os = "linux"))]
+        let connected = true;
+        tracing::info!(connected, "checked OCI network namespace before startup");
+        if connected {
+            network_activation.activate();
+        }
     }
     let mut console_input_closed = console.is_none();
     let tty = command.tty || console.is_some();
