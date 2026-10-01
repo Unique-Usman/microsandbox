@@ -295,6 +295,7 @@ fn main() {
                 serde_json::to_string(&microsandbox_runtime::launch::LaunchCapabilities {
                     protocols: vec![2, 1],
                     required_restore_backing: true,
+                    oci_readonly_root: cfg!(all(target_os = "linux", feature = "oci-runtime")),
                 })
                 .expect("serialize capabilities")
             );

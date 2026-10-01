@@ -1983,9 +1983,38 @@ fn build_vm(
         });
 
     // Root filesystem.
+    if matches!(
+        bootstrap.block_root,
+        Some(BootstrapBlockRoot::ReadOnlyVirtiofs)
+    ) && (!cfg!(all(target_os = "linux", feature = "oci-runtime")) || vm.rootfs_path.is_none())
+    {
+        return Err(RuntimeError::Custom(
+            "read-only virtiofs root requires a directory rootfs and Linux OCI runtime support"
+                .into(),
+        ));
+    }
     if let Some(ref rootfs_path) = vm.rootfs_path {
-        let backend = bind_rootfs_backend(rootfs_path, vm.rootfs_follow_root_symlinks)?;
-        builder = builder.fs(move |fs| fs.tag("/dev/root").custom(Box::new(backend)));
+        #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+        if matches!(
+            bootstrap.block_root,
+            Some(BootstrapBlockRoot::ReadOnlyVirtiofs)
+        ) {
+            let backend = readonly_rootfs_backend(rootfs_path, vm.rootfs_follow_root_symlinks)?;
+            builder = builder.fs(move |fs| {
+                fs.tag(microsandbox_protocol::bootstrap::READ_ONLY_ROOTFS_TAG)
+                    .custom(Box::new(backend))
+            });
+            let trampoline = bootstrap_trampoline_backend()?;
+            builder = builder.fs(move |fs| fs.tag("/dev/root").custom(Box::new(trampoline)));
+        } else {
+            let backend = bind_rootfs_backend(rootfs_path, vm.rootfs_follow_root_symlinks)?;
+            builder = builder.fs(move |fs| fs.tag("/dev/root").custom(Box::new(backend)));
+        }
+        #[cfg(not(all(target_os = "linux", feature = "oci-runtime")))]
+        {
+            let backend = bind_rootfs_backend(rootfs_path, vm.rootfs_follow_root_symlinks)?;
+            builder = builder.fs(move |fs| fs.tag("/dev/root").custom(Box::new(backend)));
+        }
     } else if let Some(ref vmdk_path) = vm.rootfs_vmdk {
         // EROFS fsmerge OCI rootfs: VMDK (read-only) + upper.ext4 (writable).
         #[cfg(unix)]
@@ -3043,6 +3072,20 @@ fn bind_rootfs_backend(
         ..Default::default()
     };
     PassthroughFs::new(cfg).map_err(|e| RuntimeError::Custom(format!("rootfs: {e}")))
+}
+
+#[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+fn readonly_rootfs_backend(
+    rootfs_path: &Path,
+    follow_root_symlinks: bool,
+) -> RuntimeResult<PassthroughFs> {
+    PassthroughFs::new(PassthroughConfig {
+        root_dir: rootfs_path.to_path_buf(),
+        no_symlink_root: !follow_root_symlinks,
+        readonly: true,
+        ..Default::default()
+    })
+    .map_err(|error| RuntimeError::Custom(format!("read-only rootfs: {error}")))
 }
 
 /// Canonicalize a microsandbox-owned mount root so it is symlink-free.
@@ -4130,6 +4173,33 @@ mod tests {
 
         assert_ne!(host.inode, init.inode);
         assert_eq!(init.inode, 2);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+    #[test]
+    fn readonly_rootfs_backend_refuses_host_mutations() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("original"), b"unchanged").unwrap();
+        let fs = super::readonly_rootfs_backend(root.path(), false).unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        assert!(fs.lookup(fs_context(), 1, c"original").is_ok());
+        let error = fs
+            .mkdir(
+                fs_context(),
+                1,
+                c"new-directory",
+                0o755,
+                0,
+                Default::default(),
+            )
+            .err()
+            .expect("read-only filesystem must reject directory creation");
+        assert_eq!(error.raw_os_error(), Some(libc::EROFS));
+        assert!(!root.path().join("new-directory").exists());
+        assert_eq!(
+            std::fs::read(root.path().join("original")).unwrap(),
+            b"unchanged"
+        );
     }
 
     #[cfg(unix)]

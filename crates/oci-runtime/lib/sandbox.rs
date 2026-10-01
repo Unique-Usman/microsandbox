@@ -66,6 +66,9 @@ pub(crate) async fn create_sandbox_for_bundle(
     }
 
     builder = configure_network_namespace(builder, bundle)?;
+    if bundle.spec.root().as_ref().and_then(|root| root.readonly()) == Some(true) {
+        builder = builder.label("oci.microsandbox.readonly_root", "true");
+    }
 
     if let Some(process) = process {
         builder = builder.background_command(process_args(process)?.iter().cloned());

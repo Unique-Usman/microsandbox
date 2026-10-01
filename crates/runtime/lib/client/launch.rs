@@ -66,6 +66,9 @@ pub struct LaunchCapabilities {
     /// Older probes omit this feature; ordinary protocol-2 launches are unchanged.
     #[serde(default)]
     pub required_restore_backing: bool,
+    /// OCI read-only virtiofs root boot support, absent in older runtimes.
+    #[serde(default)]
+    pub oci_readonly_root: bool,
 }
 
 /// Hidden CLI handoff describing the metrics slot the host reserved for this sandbox.

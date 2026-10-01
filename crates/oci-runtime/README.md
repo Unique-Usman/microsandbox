@@ -13,7 +13,7 @@ unsupported commands and CLI operations return explicit errors.
 Acceptance does not mean enforcement. Do not rely on OCI capabilities, seccomp,
 AppArmor/SELinux, no-new-privileges, cgroup limits, or full namespace isolation in
 this experimental runtime. VM isolation does not replace those requested
-controls. Full Docker bridge networking, read-only rootfs, and complete mount
+controls. Full Docker bridge networking and complete mount
 flags/ownership semantics also remain incomplete.
 Feature reporting does not advertise unimplemented controls or mount flags.
 
@@ -25,6 +25,45 @@ The backend keeps owner access, does not mirror setuid/setgid bits, and retains
 guest ownership metadata separately; this does not map file ownership to the
 Docker client user. Read-only mounts remain read-only. A guest-created `0600`
 file remains private on the host. The normal SDK default remains `Private`.
+
+### Read-only root filesystem
+
+`docker run --read-only --runtime runmsb ...` maps OCI `root.readonly` to a
+read-only guest root. Ordinary writes, file creation, and directory creation on
+that root fail. Explicit writable bind mounts, named volumes, and tmpfs mounts
+remain writable; the root restriction is not applied recursively to them.
+
+Docker may already mount the host rootfs read-only before invoking the runtime.
+The VMM therefore exports that directory through a read-only virtiofs backend
+and boots the agent from the existing bootstrap filesystem. The agent assembles
+an overlay with a read-only lower and a 64 MiB tmpfs upper used only for boot
+setup: mountpoints, runtime files, and guest configuration. Before reporting
+ready or starting workloads, it remounts the root overlay read-only. This does
+not require writing to Docker's rootfs or making the host mount writable.
+
+The implementation is in `lib/sandbox.rs`, SDK `runtime/spawn.rs`, runtime
+`runner/vm.rs`, and guest `readonly_root.rs`/`init.rs`. Rebuild the musl guest
+agent and embed it when rebuilding `msb`; rebuilding `runmsb` alone is not enough.
+The SDK checks the selected `msb` capability, and a distinct required bootstrap
+variant makes older agents reject the mode. There is no writable fallback.
+Normal writable roots keep their existing boot path.
+
+This implements filesystem write protection, not the still-missing capability
+or security-policy enforcement. In particular, a guest process with mount
+privileges must not be treated as unable to remount guest filesystems. The host
+rootfs export itself remains read-only.
+
+After installing the rebuilt binaries, these commands should print
+`ROOT_IS_READONLY` and `TMPFS_OK`, respectively:
+
+```bash
+docker run --rm --runtime runmsb --read-only alpine sh -ec \
+  'if touch /root-write; then exit 1; fi; echo ROOT_IS_READONLY'
+docker run --rm --runtime runmsb --read-only --tmpfs /scratch alpine sh -ec \
+  'echo TMPFS_OK > /scratch/result; cat /scratch/result'
+```
+
+### Runtime compatibility
 
 Compatibility-only CLI switches remain accepted: `--systemd-cgroup`,
 `--cgroup-manager`, `--rootless`, `--no-pivot`, and `--no-new-keyring`. They do not

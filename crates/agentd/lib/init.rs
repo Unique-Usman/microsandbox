@@ -57,6 +57,12 @@ pub fn init(
     tls::install_host_cas()?;
     linux::ensure_scripts_path_in_profile()?;
     linux::create_run_dir()?;
+    if matches!(
+        params.block_root,
+        Some(crate::config::BlockRootSpec::ReadOnlyVirtiofs)
+    ) {
+        crate::readonly_root::seal()?;
+    }
     Ok(())
 }
 
@@ -286,6 +292,7 @@ mod linux {
         mkdir_ignore_exists("/newroot")?;
 
         match spec {
+            BlockRootSpec::ReadOnlyVirtiofs => crate::readonly_root::mount()?,
             BlockRootSpec::DiskImage { device, fstype } => {
                 mount_disk_image(device, fstype.as_deref())?;
                 crate::root_disk::register("/newroot", device);

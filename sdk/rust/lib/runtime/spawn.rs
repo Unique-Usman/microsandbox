@@ -356,6 +356,10 @@ pub async fn spawn_sandbox(
     // the selected executable may have changed since creation. Validate its
     // effective configuration here for both initial launch and later starts.
     launch_contract.validate_launch_intent(config)?;
+    #[cfg(feature = "oci-runtime")]
+    if oci_readonly_root(config) {
+        launch_contract::require_oci_readonly_root(&resolved_runtime.msb_path).await?;
+    }
     if config.checkpoint_restore.as_ref().is_some_and(|restore| {
         restore
             .external_mounts
@@ -3347,6 +3351,8 @@ fn machine_cli_args(
 /// Build guest settings shared by launch preflight and the final payload.
 pub(crate) fn guest_bootstrap(config: &SandboxConfig) -> GuestBootstrap {
     GuestBootstrap {
+        #[cfg(feature = "oci-runtime")]
+        block_root: oci_readonly_root(config).then_some(BootstrapBlockRoot::ReadOnlyVirtiofs),
         hostname: Some(
             config
                 .spec
@@ -3395,6 +3401,15 @@ pub(crate) fn guest_bootstrap(config: &SandboxConfig) -> GuestBootstrap {
         }),
         ..GuestBootstrap::default()
     }
+}
+
+#[cfg(feature = "oci-runtime")]
+pub(super) fn oci_readonly_root(config: &SandboxConfig) -> bool {
+    config
+        .spec
+        .labels
+        .get("oci.microsandbox.readonly_root")
+        .is_some_and(|value| value == "true")
 }
 
 fn startup_command(config: &SandboxConfig) -> Option<StartupCommand> {
@@ -4930,6 +4945,37 @@ mod tests {
             startup.session_id_path.as_deref(),
             Some(Path::new("/tmp/init.session"))
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "oci-runtime")]
+    async fn test_oci_readonly_root_bootstrap_is_opt_in_and_cannot_use_legacy_env() {
+        let mut config = SandboxBuilder::new("readonly-test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+        assert!(super::guest_bootstrap(&config).block_root.is_none());
+        config
+            .spec
+            .labels
+            .insert("oci.microsandbox.readonly_root".into(), "true".into());
+        let bootstrap = super::guest_bootstrap(&config);
+        assert_eq!(
+            bootstrap.block_root,
+            Some(BootstrapBlockRoot::ReadOnlyVirtiofs)
+        );
+        assert!(
+            crate::runtime::launch_input::legacy_env(&bootstrap)
+                .unwrap_err()
+                .to_string()
+                .contains("read-only virtiofs root")
+        );
+        config
+            .spec
+            .labels
+            .insert("oci.microsandbox.readonly_root".into(), "false".into());
+        assert!(super::guest_bootstrap(&config).block_root.is_none());
     }
 
     #[tokio::test]
