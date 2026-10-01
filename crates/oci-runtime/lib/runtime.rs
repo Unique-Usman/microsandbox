@@ -50,11 +50,7 @@ impl MicrosandboxOciRuntime {
 
     /// Create the Microsandbox-backed OCI container environment.
     pub async fn create(&self, options: CreateOptions) -> Result<()> {
-        let mut bundle = OciBundle::load(&options.bundle)?;
-        let raw = std::fs::read(bundle.path.join("config.json"))?;
-        crate::validation::validate_bundle(&serde_json::from_slice(&raw)?)?;
-        bundle.spec = serde_json::from_slice(&raw)?;
-        bundle.validate()?;
+        let bundle = OciBundle::load(&options.bundle)?;
         if bundle
             .process()
             .is_some_and(|process| process.terminal() == Some(true))
@@ -434,7 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_bundle_does_not_create_state() {
+    async fn invalid_bundle_does_not_create_state() {
         let root = tempfile::tempdir().unwrap();
         let bundle = tempfile::tempdir().unwrap();
         std::fs::create_dir(bundle.path().join("rootfs")).unwrap();
@@ -442,7 +438,7 @@ mod tests {
             bundle.path().join("config.json"),
             r#"{
             "ociVersion":"1.2.0","root":{"path":"rootfs"},
-            "process":{"args":["/hello"],"cwd":"/","user":{"uid":0,"gid":0},"noNewPrivileges":true}
+            "process":{"args":["/hello"],"cwd":"relative","user":{"uid":0,"gid":0}}
         }"#,
         )
         .unwrap();
@@ -455,8 +451,28 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("noNewPrivileges"));
+        assert!(error.to_string().contains("cwd"));
         assert!(!root.path().join("rejected").exists());
+    }
+
+    #[test]
+    fn bundle_loading_accepts_pending_docker_controls() {
+        let bundle = tempfile::tempdir().unwrap();
+        std::fs::create_dir(bundle.path().join("rootfs")).unwrap();
+        std::fs::write(
+            bundle.path().join("config.json"),
+            r#"{
+                "ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},
+                "process":{"args":["/hello"],"cwd":"/","user":{"uid":0,"gid":0},
+                    "noNewPrivileges":true,"capabilities":{}},
+                "linux":{"namespaces":[{"type":"network"}],
+                    "resources":{"memory":{"limit":268435456}}},
+                "mounts":[{"destination":"/tmp","type":"tmpfs","source":"tmpfs"}]
+            }"#,
+        )
+        .unwrap();
+        // Parsing these fields preserves compatibility; it does not enforce them.
+        OciBundle::load(bundle.path()).unwrap();
     }
 
     #[tokio::test]

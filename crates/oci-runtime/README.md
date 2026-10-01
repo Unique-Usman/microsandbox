@@ -2,25 +2,20 @@
 
 ## Overview
 
-### Strict support boundary
+### Compatibility and limitations
 
-`runmsb` now rejects OCI configuration fields whose semantics it cannot enforce,
-before allocating container state. This is a breaking change for ordinary Docker
-bundles: Docker normally supplies capabilities, namespaces, mounts, and resource
-settings that this runtime does not fully implement. Those bundles now fail
-explicitly, rather than launching with silently missing restrictions. The Docker
-examples below describe integration workflows and historical tests, not a claim
-that the strict build currently accepts Docker's default bundle.
+`runmsb` accepts Docker/containerd OCI configuration without a blanket rejection
+of cgroups, resources, namespaces, security settings, hooks, or mounts. These
+fields remain implementation work where their semantics are not yet supported.
+The existing bundle validation still rejects malformed configurations, and
+unsupported commands and CLI operations return explicit errors.
 
-The accepted configuration subset is an OCI 1.0.x/1.1.0/1.2.0 bundle with a
-writable root, process args/environment/cwd, numeric UID/GID, and optional terminal
-dimensions. Annotations are metadata. Additional groups, capabilities, rlimits,
-no-new-privileges, security profiles, hooks, nonempty mounts, and nonempty Linux
-configuration (including network namespaces and cgroups) are rejected. Empty
-capability sets are also rejected: dropping every capability is an enforcement
-request, not a no-op. `--network none` must not silently fall back to host egress.
-Mount requests are rejected until their complete flags and host ownership
-semantics can be guaranteed. Feature reporting no longer advertises mount flags.
+Acceptance does not mean enforcement. Do not rely on OCI capabilities, seccomp,
+AppArmor/SELinux, no-new-privileges, cgroup limits, or full namespace isolation in
+this experimental runtime. VM isolation does not replace those requested
+controls. Docker network isolation (including `--network none`), read-only
+rootfs, and complete mount flags/ownership semantics also remain incomplete.
+Feature reporting does not advertise unimplemented controls or mount flags.
 
 Compatibility-only CLI switches remain accepted: `--systemd-cgroup`,
 `--cgroup-manager`, `--rootless`, `--no-pivot`, and `--no-new-keyring`. They do not

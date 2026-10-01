@@ -169,7 +169,6 @@ pub(crate) async fn forward_host_signal(control: &ExecControl, signal: i32) -> R
 pub(crate) fn load_process(path: &Path) -> Result<OciProcess> {
     let data = std::fs::read_to_string(path)
         .with_context(|| format!("read OCI process JSON `{}`", path.display()))?;
-    crate::validation::validate_process(&serde_json::from_str(&data)?)?;
     let process: OciProcess = serde_json::from_str(&data)
         .with_context(|| format!("parse OCI process JSON `{}`", path.display()))?;
     validate_process(&process, path.parent().unwrap_or_else(|| Path::new(".")))
@@ -340,6 +339,20 @@ mod tests {
     fn rejects_invalid_env_entries() {
         assert!(env_pairs(&["PATH=/bin".to_string()]).is_ok());
         assert!(env_pairs(&["PATH".to_string()]).is_err());
+    }
+
+    #[test]
+    fn process_file_accepts_pending_security_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("process.json");
+        std::fs::write(
+            &path,
+            r#"{"args":["/bin/sh"],"cwd":"/","user":{"uid":0,"gid":0},
+                "noNewPrivileges":true,"capabilities":{},
+                "rlimits":[{"type":"RLIMIT_NOFILE","hard":1024,"soft":1024}]}"#,
+        )
+        .unwrap();
+        load_process(&path).unwrap();
     }
 
     #[test]
