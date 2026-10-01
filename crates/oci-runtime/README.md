@@ -245,10 +245,18 @@ Docker configures networking in the network namespace of the PID returned by the
 runtime now returns the VMM PID, so Docker attaches networking to the process that owns the
 Microsandbox userspace virtio-net backend.
 
-When the OCI bundle requests a network namespace, the VMM process calls `unshare(CLONE_NEWNET)`
-before libkrun starts. Docker can then attach its veth to the VMM namespace without conflicting with
-the host route table. The guest still uses the normal Microsandbox-managed userspace virtio-net
-path, but that backend now runs inside the OCI network namespace.
+When the OCI bundle requests a new network namespace without a path, the VMM process calls
+`unshare(CLONE_NEWNET)` before libkrun starts. When the request includes a namespace path, the SDK
+opens that namespace before spawning and the child calls `setns(..., CLONE_NEWNET)` before exec.
+Opening or joining a requested namespace must succeed; there is no fallback to host networking.
+Without an OCI network namespace entry, the child inherits the launcher's network namespace.
+
+Docker can attach its veth to the VMM namespace without conflicting with the host route table.
+The guest still uses the normal Microsandbox-managed userspace virtio-net path, but that backend
+runs inside the requested OCI network namespace. In particular, an existing namespace must not
+be ignored: doing so lets a `--network none` container use the launcher's host routes.
+Joined namespaces retain automatic guest address selection from their routes. Only newly created
+namespaces use an explicit guest address pool while waiting for Docker to attach networking.
 
 This removes the route conflict and preserves outbound Microsandbox networking, but it is not full
 Docker bridge integration. Docker's veth is not connected to the guest virtio-net backend, so

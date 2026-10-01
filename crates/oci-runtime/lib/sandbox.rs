@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
-use microsandbox::sandbox::{HostPermissions, MountBuilder, Sandbox};
+use microsandbox::sandbox::{HostPermissions, MountBuilder, Sandbox, SandboxBuilder};
 use microsandbox_runtime::oci::{OciBundle, sandbox_name_for_container};
 
 use crate::console::process_console_size;
@@ -21,6 +21,7 @@ const OCI_CONSOLE_ROWS_LABEL: &str = "oci.microsandbox.console_rows";
 const OCI_CONSOLE_COLS_LABEL: &str = "oci.microsandbox.console_cols";
 const OCI_INIT_SESSION_PATH_LABEL: &str = "oci.microsandbox.init_session_path";
 const OCI_ISOLATE_NETWORK_NAMESPACE_LABEL: &str = "oci.microsandbox.isolate_network_namespace";
+const OCI_NETWORK_NAMESPACE_PATH_LABEL: &str = "oci.microsandbox.network_namespace_path";
 const OCI_SIGNAL_PATH_LABEL: &str = "oci.microsandbox.signal_path";
 const OCI_STARTUP_CWD_LABEL: &str = "oci.microsandbox.startup_cwd";
 const OCI_START_SIGNAL_PATH_LABEL: &str = "oci.microsandbox.start_signal_path";
@@ -64,12 +65,7 @@ pub(crate) async fn create_sandbox_for_bundle(
         }
     }
 
-    if requires_fresh_network_namespace(bundle) {
-        builder = builder.label(OCI_ISOLATE_NETWORK_NAMESPACE_LABEL, "true");
-        builder = builder.network(|network| {
-            network.ipv4_pool("172.16.0.0/12".parse().expect("valid OCI IPv4 pool"))
-        });
-    }
+    builder = configure_network_namespace(builder, bundle)?;
 
     if let Some(process) = process {
         builder = builder.background_command(process_args(process)?.iter().cloned());
@@ -144,16 +140,40 @@ pub(crate) async fn sandbox_host_pid_from_handle(id: &str) -> Option<i32> {
 }
 
 pub(crate) fn requires_fresh_network_namespace(bundle: &OciBundle) -> bool {
+    network_namespace(bundle).is_some_and(|namespace| namespace.path().is_none())
+}
+
+fn configure_network_namespace(
+    mut builder: SandboxBuilder,
+    bundle: &OciBundle,
+) -> Result<SandboxBuilder> {
+    if let Some(path) = network_namespace(bundle).and_then(|namespace| namespace.path().as_ref()) {
+        builder = builder.label(
+            OCI_NETWORK_NAMESPACE_PATH_LABEL,
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("network namespace path is not UTF-8"))?,
+        );
+    } else if requires_fresh_network_namespace(bundle) {
+        builder = builder.label(OCI_ISOLATE_NETWORK_NAMESPACE_LABEL, "true");
+        // Docker attaches the fresh namespace after create. Existing namespaces
+        // instead use route detection, including the empty --network none case.
+        builder = builder.network(|network| {
+            network.ipv4_pool("172.16.0.0/12".parse().expect("valid OCI IPv4 pool"))
+        });
+    }
+    Ok(builder)
+}
+
+fn network_namespace(bundle: &OciBundle) -> Option<&oci_spec::runtime::LinuxNamespace> {
     bundle
         .spec
         .linux()
         .as_ref()
         .and_then(|linux| linux.namespaces().as_ref())
-        .is_some_and(|namespaces| {
-            namespaces.iter().any(|namespace| {
-                namespace.typ() == oci_spec::runtime::LinuxNamespaceType::Network
-                    && namespace.path().is_none()
-            })
+        .and_then(|namespaces| {
+            namespaces
+                .iter()
+                .find(|namespace| namespace.typ() == oci_spec::runtime::LinuxNamespaceType::Network)
         })
 }
 
@@ -264,8 +284,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn detects_fresh_oci_network_namespace() {
+    #[tokio::test]
+    async fn detects_fresh_oci_network_namespace() {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("rootfs")).expect("rootfs");
         std::fs::write(
@@ -287,6 +307,95 @@ mod tests {
         let bundle = OciBundle::load(temp.path()).expect("load bundle");
 
         assert!(requires_fresh_network_namespace(&bundle));
+        let config = configure_network_namespace(
+            Sandbox::builder("network-test").image(bundle.rootfs_path()),
+            &bundle,
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+        assert_eq!(
+            config
+                .spec
+                .labels
+                .get(OCI_ISOLATE_NETWORK_NAMESPACE_LABEL)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            !config
+                .spec
+                .labels
+                .contains_key(OCI_NETWORK_NAMESPACE_PATH_LABEL)
+        );
+        assert_eq!(
+            config
+                .spec
+                .network
+                .interface
+                .as_ref()
+                .and_then(|interface| interface.ipv4_pool),
+            Some("172.16.0.0/12".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn distinguishes_joined_and_inherited_network_namespaces() {
+        for (namespaces, expected) in [
+            (serde_json::json!([]), None),
+            (serde_json::json!([{"type": "pid"}]), None),
+            (
+                serde_json::json!([{"type": "network", "path": "/run/docker/netns/test"}]),
+                Some(Path::new("/run/docker/netns/test")),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("rootfs")).unwrap();
+            let config = serde_json::json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs"},
+                "linux": {"namespaces": namespaces},
+            });
+            std::fs::write(temp.path().join("config.json"), config.to_string()).unwrap();
+            let bundle = OciBundle::load(temp.path()).unwrap();
+            assert!(!requires_fresh_network_namespace(&bundle));
+            assert_eq!(
+                network_namespace(&bundle).and_then(|ns| ns.path().as_deref()),
+                expected
+            );
+            let config = configure_network_namespace(
+                Sandbox::builder("network-test").image(bundle.rootfs_path()),
+                &bundle,
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+            assert_eq!(
+                config
+                    .spec
+                    .labels
+                    .get(OCI_NETWORK_NAMESPACE_PATH_LABEL)
+                    .map(String::as_str),
+                expected.and_then(Path::to_str)
+            );
+            assert!(
+                !config
+                    .spec
+                    .labels
+                    .contains_key(OCI_ISOLATE_NETWORK_NAMESPACE_LABEL)
+            );
+            assert!(
+                config
+                    .spec
+                    .network
+                    .interface
+                    .as_ref()
+                    .and_then(|interface| interface.ipv4_pool)
+                    .is_none()
+            );
+        }
     }
 
     #[test]

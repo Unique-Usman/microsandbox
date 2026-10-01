@@ -129,8 +129,10 @@ const OCI_CONSOLE_ROWS_LABEL: &str = "oci.microsandbox.console_rows";
 const OCI_CONSOLE_COLS_LABEL: &str = "oci.microsandbox.console_cols";
 #[cfg(feature = "oci-runtime")]
 const OCI_INIT_SESSION_PATH_LABEL: &str = "oci.microsandbox.init_session_path";
-#[cfg(feature = "oci-runtime")]
+#[cfg(all(target_os = "linux", feature = "oci-runtime"))]
 const OCI_ISOLATE_NETWORK_NAMESPACE_LABEL: &str = "oci.microsandbox.isolate_network_namespace";
+#[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+const OCI_NETWORK_NAMESPACE_PATH_LABEL: &str = "oci.microsandbox.network_namespace_path";
 #[cfg(feature = "oci-runtime")]
 const OCI_SIGNAL_PATH_LABEL: &str = "oci.microsandbox.signal_path";
 #[cfg(feature = "oci-runtime")]
@@ -324,6 +326,8 @@ pub async fn spawn_sandbox(
     mode: SpawnMode,
     lifecycle_guard: Option<microsandbox_runtime::ipc::SandboxLifecycleGuard>,
 ) -> MicrosandboxResult<(ProcessHandle, PathBuf)> {
+    #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+    let network_namespace = open_oci_network_namespace(config)?;
     // Durable configuration stores only host-side source references. Resolve
     // them into the private runtime configuration before the sandbox process
     // is spawned.
@@ -694,6 +698,7 @@ pub async fn spawn_sandbox(
         }
     };
 
+    #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
     let isolate_network_namespace = should_isolate_network_namespace(config);
     #[cfg(all(unix, feature = "oci-runtime"))]
     let inherited_console_fd = config
@@ -747,9 +752,8 @@ pub async fn spawn_sandbox(
         let mut disk_lock_fds: Vec<i32> = disk_locks.iter().map(AsRawFd::as_raw_fd).collect();
         unsafe {
             cmd.pre_exec(move || {
-                if isolate_network_namespace && libc::unshare(libc::CLONE_NEWNET) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+                enter_oci_network_namespace(network_namespace.as_ref(), isolate_network_namespace)?;
 
                 if startup_write_fd.is_some() {
                     detach_from_launcher_session()?;
@@ -3497,20 +3501,48 @@ fn should_inherit_detached_stdio(config: &SandboxConfig) -> bool {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+fn open_oci_network_namespace(config: &SandboxConfig) -> MicrosandboxResult<Option<File>> {
+    let Some(path) = config.spec.labels.get(OCI_NETWORK_NAMESPACE_PATH_LABEL) else {
+        return Ok(None);
+    };
+    if should_isolate_network_namespace(config) {
+        return Err(MicrosandboxError::InvalidConfig(
+            "cannot create and join a network namespace at the same time".to_string(),
+        ));
+    }
+    if !Path::new(path).is_absolute() {
+        return Err(MicrosandboxError::InvalidConfig(
+            "OCI network namespace path must be absolute".to_string(),
+        ));
+    }
+    // Open before fork; the owned descriptor pins the namespace until exec.
+    // setns validates its type in the child and never falls back to the host.
+    File::open(path).map(Some).map_err(|error| {
+        MicrosandboxError::InvalidConfig(format!("open OCI network namespace `{path}`: {error}"))
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+fn enter_oci_network_namespace(namespace: Option<&File>, isolate: bool) -> std::io::Result<()> {
+    // Called only in the forked child before exec. Do not allocate or acquire locks.
+    if let Some(namespace) = namespace {
+        if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    } else if isolate && unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "oci-runtime"))]
 fn should_isolate_network_namespace(config: &SandboxConfig) -> bool {
-    #[cfg(feature = "oci-runtime")]
-    {
-        config
-            .spec
-            .labels
-            .get(OCI_ISOLATE_NETWORK_NAMESPACE_LABEL)
-            .is_some_and(|value| value == "true")
-    }
-    #[cfg(not(feature = "oci-runtime"))]
-    {
-        let _ = config;
-        false
-    }
+    config
+        .spec
+        .labels
+        .get(OCI_ISOLATE_NETWORK_NAMESPACE_LABEL)
+        .is_some_and(|value| value == "true")
 }
 
 fn resolve_startup_command(config: &SandboxConfig) -> Option<(String, Vec<String>)> {
@@ -4898,6 +4930,113 @@ mod tests {
             startup.session_id_path.as_deref(),
             Some(Path::new("/tmp/init.session"))
         );
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+    async fn test_oci_network_namespace_is_opened_before_spawn() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let mut config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+        assert!(
+            super::open_oci_network_namespace(&config)
+                .unwrap()
+                .is_none()
+        );
+        config.spec.labels.insert(
+            super::OCI_NETWORK_NAMESPACE_PATH_LABEL.into(),
+            "/proc/self/ns/net".into(),
+        );
+        let namespace = super::open_oci_network_namespace(&config).unwrap().unwrap();
+        assert_eq!(
+            namespace.metadata().unwrap().ino(),
+            std::fs::metadata("/proc/self/ns/net").unwrap().ino()
+        );
+        let flags = unsafe { libc::fcntl(namespace.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+
+        config.spec.labels.insert(
+            super::OCI_ISOLATE_NETWORK_NAMESPACE_LABEL.into(),
+            "true".into(),
+        );
+        assert!(
+            super::open_oci_network_namespace(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot create and join")
+        );
+        config
+            .spec
+            .labels
+            .remove(super::OCI_ISOLATE_NETWORK_NAMESPACE_LABEL);
+        config.spec.labels.insert(
+            super::OCI_NETWORK_NAMESPACE_PATH_LABEL.into(),
+            "relative/netns".into(),
+        );
+        assert!(
+            super::open_oci_network_namespace(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("must be absolute")
+        );
+        let temp = tempfile::tempdir().unwrap();
+        config.spec.labels.insert(
+            super::OCI_NETWORK_NAMESPACE_PATH_LABEL.into(),
+            temp.path().join("missing").display().to_string(),
+        );
+        assert!(
+            super::open_oci_network_namespace(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("open OCI network namespace")
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+    fn test_oci_invalid_network_namespace_does_not_execute_child() {
+        use std::os::unix::process::CommandExt;
+
+        let namespace = std::fs::File::open("/dev/null").unwrap();
+        let mut command = std::process::Command::new("/bin/true");
+        unsafe {
+            command.pre_exec(move || super::enter_oci_network_namespace(Some(&namespace), false));
+        }
+        assert!(command.spawn().is_err());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+    #[ignore = "requires CAP_SYS_ADMIN; run under unshare --user --map-root-user --net"]
+    fn test_oci_child_network_namespace_join_and_isolation() {
+        use std::os::unix::process::CommandExt;
+
+        let parent = std::fs::read_link("/proc/self/ns/net").unwrap();
+        for join_parent in [false, true] {
+            let namespace = std::fs::File::open("/proc/self/ns/net").unwrap();
+            let mut command = std::process::Command::new("/bin/readlink");
+            command.arg("/proc/self/ns/net");
+            unsafe {
+                command.pre_exec(move || {
+                    super::enter_oci_network_namespace(None, true)?;
+                    if join_parent {
+                        super::enter_oci_network_namespace(Some(&namespace), false)?;
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            let child = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(child.trim() == parent.to_str().unwrap(), join_parent);
+            assert_eq!(std::fs::read_link("/proc/self/ns/net").unwrap(), parent);
+        }
     }
 
     #[tokio::test]
