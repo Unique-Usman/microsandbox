@@ -50,12 +50,12 @@ use crate::heartbeat::{self, HeartbeatDecision, HeartbeatReader};
 use crate::launch::FileMountConfig;
 #[cfg(unix)]
 pub use crate::launch::LIFECYCLE_LOCK_FD;
-#[cfg(all(unix, feature = "oci-runtime"))]
-pub use crate::launch::OCI_CONSOLE_FD;
 pub use crate::launch::{
     BRANCH_MEMORY_FD, CONFIG_FD, MetricsSlotHandoff, PARENT_WATCH_DETACH, PARENT_WATCH_FD,
     STARTUP_FD, StartupCommand,
 };
+#[cfg(all(unix, feature = "oci-runtime"))]
+pub use crate::launch::{OCI_CONSOLE_FD, OCI_STDIN_FD};
 use crate::logging::LogLevel;
 use crate::metrics::run_metrics_sampler;
 use crate::relay::{self, AgentRelay};
@@ -3091,9 +3091,21 @@ fn startup_stdio(config: &Config) -> RuntimeResult<Option<crate::startup::Startu
         return Err(std::io::Error::last_os_error().into());
     }
 
+    let stdout = unsafe { std::fs::File::from_raw_fd(stdout) };
+    let stderr = unsafe { std::fs::File::from_raw_fd(stderr) };
     Ok(Some(crate::startup::StartupStdio {
-        stdout: unsafe { std::fs::File::from_raw_fd(stdout) },
-        stderr: unsafe { std::fs::File::from_raw_fd(stderr) },
+        stdin: if config
+            .startup_command
+            .as_ref()
+            .is_some_and(|command| !command.tty)
+        {
+            // Reopen instead of dup: nonblocking flags must not affect the shim's fd.
+            Some(crate::startup::open_startup_stdin(OCI_STDIN_FD)?)
+        } else {
+            None
+        },
+        stdout,
+        stderr,
     }))
 }
 

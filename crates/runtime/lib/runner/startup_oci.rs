@@ -36,6 +36,8 @@ pub(crate) enum StartupCommandExit {
 
 /// Optional host stdio handles used for OCI startup command forwarding.
 pub(crate) struct StartupStdio {
+    /// Input owned by this workload rather than the VMM console.
+    pub(crate) stdin: Option<std::fs::File>,
     /// Original host stdout captured before runtime log redirection.
     pub(crate) stdout: std::fs::File,
 
@@ -56,6 +58,12 @@ struct StartupConsoleBridge {
 
 #[cfg(not(unix))]
 struct StartupConsoleBridge;
+
+enum StartupInput {
+    #[cfg(unix)]
+    Pipe(StartupConsoleBridge),
+    File(tokio::fs::File),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PtySize {
@@ -113,6 +121,12 @@ async fn run_startup_command_inner(
     let mut session_id_path = command.session_id_path;
     let signal_path = command.signal_path.clone();
     let uses_console = console.is_some();
+    let mut stdin = stdio
+        .as_mut()
+        .and_then(|stdio| stdio.stdin.take())
+        .map(startup_input)
+        .transpose()?;
+    let mut started = false;
     // Keep the inherited PTY slave open during OCI `create`. containerd owns
     // the master and waits for a live slave before it invokes OCI `start`.
     let mut console = open_startup_console(console)?;
@@ -145,13 +159,21 @@ async fn run_startup_command_inner(
         .await
         .map_err(|err| RuntimeError::Custom(format!("startup command dispatch: {err}")))?;
     let id = stream.id();
-    let mut initial_stdin = initial_startup_stdin(uses_console);
+    let mut initial_stdin = initial_startup_stdin(uses_console || stdin.is_some());
     let mut resize_poll = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut signal_poll = tokio::time::interval(std::time::Duration::from_millis(20));
     let mut input = [0u8; 4096];
+    let mut stdin_buf = [0u8; 4096];
 
     loop {
         tokio::select! {
+            read = read_startup_input(&mut stdin, &mut stdin_buf), if started && stdin.is_some() => {
+                let n = read.map_err(|error| RuntimeError::Custom(format!("startup stdin: {error}")))?;
+                let result = client.send(id, TypedMessage::new(MessageType::ExecStdin,
+                    &ExecStdin { data: stdin_buf[..n].to_vec() })).await;
+                check_initial_stdin_delivery(result)?;
+                if n == 0 { stdin = None; }
+            }
             _ = signal_poll.tick(), if signal_path.is_some() => {
                 if let Some(signal) = take_signal_request(signal_path.as_deref().unwrap())? {
                     let payload = ExecSignal { signal };
@@ -175,7 +197,7 @@ async fn run_startup_command_inner(
                 }
             }
             read = read_optional_startup_console_input(console.as_ref(), &mut input),
-                if console.is_some() && !console_input_closed =>
+                if started && console.is_some() && !console_input_closed =>
             {
                 match read {
                     Ok(0) => {
@@ -220,6 +242,7 @@ async fn run_startup_command_inner(
                 };
                 match MessageType::from_wire_str(&message.t) {
                     Some(MessageType::ExecStarted) => {
+                        started = true;
                         if let Some(path) = session_id_path.take() {
                             write_session_id(&path, id)?;
                         }
@@ -278,6 +301,41 @@ async fn run_startup_command_inner(
 
 fn initial_startup_stdin(uses_console: bool) -> Option<ExecStdin> {
     (!uses_console).then(|| ExecStdin { data: Vec::new() })
+}
+
+#[cfg(unix)]
+pub(crate) fn open_startup_stdin(fd: i32) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(format!("/proc/self/fd/{fd}"))
+}
+
+fn startup_input(file: std::fs::File) -> RuntimeResult<StartupInput> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file.metadata()?.file_type().is_fifo() {
+            return Ok(StartupInput::Pipe(StartupConsoleBridge {
+                fd: AsyncFd::new(file.into())?,
+            }));
+        }
+    }
+    Ok(StartupInput::File(tokio::fs::File::from_std(file)))
+}
+
+async fn read_startup_input(
+    input: &mut Option<StartupInput>,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncReadExt;
+    match input {
+        #[cfg(unix)]
+        Some(StartupInput::Pipe(pipe)) => read_startup_console_input(pipe, buf).await,
+        Some(StartupInput::File(file)) => file.read(buf).await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(unix)]
@@ -575,6 +633,80 @@ mod tests {
     use std::path::Path;
 
     use microsandbox_agent_client::{ClientError, ErrorKind};
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inherited_pipe_delivers_bytes_then_eof_without_changing_parent_flags() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let (reader, writer) = nix::unistd::pipe().unwrap();
+        let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        let file = super::open_startup_stdin(reader.as_raw_fd()).unwrap();
+        let mut input = Some(super::startup_input(file).unwrap());
+        let mut buf = [0; 32];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                super::read_startup_input(&mut input, &mut buf)
+            )
+            .await
+            .is_err()
+        );
+        let mut writer = std::fs::File::from(writer);
+        writer.write_all(b"INPUT_OK\n").unwrap();
+        drop(writer);
+        let n = super::read_startup_input(&mut input, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..n], b"INPUT_OK\n");
+        assert_eq!(
+            super::read_startup_input(&mut input, &mut buf)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) },
+            flags
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn null_startup_input_reaches_eof() {
+        let mut input =
+            Some(super::startup_input(std::fs::File::open("/dev/null").unwrap()).unwrap());
+        assert_eq!(
+            super::read_startup_input(&mut input, &mut [0; 8])
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inherited_regular_file_delivers_bytes_then_eof() {
+        use std::io::{Seek, Write};
+        use std::os::fd::AsRawFd;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"FILE_OK").unwrap();
+        file.rewind().unwrap();
+        let mut input = Some(
+            super::startup_input(super::open_startup_stdin(file.as_raw_fd()).unwrap()).unwrap(),
+        );
+        let mut buf = [0; 32];
+        let n = super::read_startup_input(&mut input, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..n], b"FILE_OK");
+        assert_eq!(
+            super::read_startup_input(&mut input, &mut buf)
+                .await
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn stdin_eof_racing_with_exit_keeps_receiving_terminal_event() {

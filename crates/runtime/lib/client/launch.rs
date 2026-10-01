@@ -46,6 +46,10 @@ pub const LIFECYCLE_LOCK_FD: i32 = 99;
 #[cfg(all(unix, feature = "oci-runtime"))]
 pub const OCI_CONSOLE_FD: i32 = 100;
 
+/// Fixed fd carrying non-terminal OCI workload input, separate from VMM stdin.
+#[cfg(all(unix, feature = "oci-runtime"))]
+pub const OCI_STDIN_FD: i32 = 101;
+
 /// Control byte sent by the owner to stop parent-watch monitoring without stopping the sandbox.
 pub const PARENT_WATCH_DETACH: u8 = 1;
 

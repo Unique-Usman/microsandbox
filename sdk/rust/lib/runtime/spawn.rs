@@ -9,6 +9,8 @@
 use std::fmt::Write as _;
 #[cfg(unix)]
 use std::fs::OpenOptions;
+#[cfg(all(unix, feature = "oci-runtime"))]
+use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -697,6 +699,12 @@ pub async fn spawn_sandbox(
     let inherited_console_fd = config
         .inherited_startup_console()
         .map(|console| console.as_raw_fd());
+    #[cfg(all(unix, feature = "oci-runtime"))]
+    let inherited_stdin = if should_inherit_detached_stdio(config) {
+        Some(std::io::stdin().as_fd().try_clone_to_owned()?)
+    } else {
+        None
+    };
 
     // Build the command.
     let mut cmd = Command::new(&msb_path);
@@ -758,6 +766,10 @@ pub async fn spawn_sandbox(
                 let mut console_mapping = inherited_console_fd.map(|fd| {
                     InheritedFdMapping::new(fd, microsandbox_runtime::vm::OCI_CONSOLE_FD)
                 });
+                #[cfg(feature = "oci-runtime")]
+                let mut stdin_mapping = inherited_stdin.as_ref().map(|fd| {
+                    InheritedFdMapping::new(fd.as_raw_fd(), microsandbox_runtime::vm::OCI_STDIN_FD)
+                });
                 let mut lifecycle_mapping = InheritedFdMapping::new(
                     lifecycle_lock_fd,
                     microsandbox_runtime::vm::LIFECYCLE_LOCK_FD,
@@ -772,10 +784,14 @@ pub async fn spawn_sandbox(
                 // fixed inherited fd numbers. Move those sources away before
                 // any dup2 call can overwrite a later source fd.
                 #[cfg(feature = "oci-runtime")]
-                let mut next_spare_fd = microsandbox_runtime::vm::OCI_CONSOLE_FD + 1;
+                let mut next_spare_fd = microsandbox_runtime::vm::OCI_STDIN_FD + 1;
                 #[cfg(not(feature = "oci-runtime"))]
                 let mut next_spare_fd = microsandbox_runtime::vm::LIFECYCLE_LOCK_FD + 1;
                 move_reserved_source_fd(&mut config_mapping, &mut next_spare_fd)?;
+                #[cfg(feature = "oci-runtime")]
+                if let Some(mapping) = stdin_mapping.as_mut() {
+                    move_reserved_source_fd(mapping, &mut next_spare_fd)?;
+                }
                 if let Some(mapping) = parent_watch_mapping.as_mut() {
                     move_reserved_source_fd(mapping, &mut next_spare_fd)?;
                 }
@@ -796,6 +812,10 @@ pub async fn spawn_sandbox(
                 inherit_disk_lock_fds(&mut disk_lock_fds, &mut next_spare_fd)?;
 
                 dup_inherited_fd(config_mapping.src, config_mapping.dst)?;
+                #[cfg(feature = "oci-runtime")]
+                if let Some(mapping) = stdin_mapping {
+                    dup_inherited_fd(mapping.src, mapping.dst)?;
+                }
                 if let Some(mapping) = parent_watch_mapping {
                     dup_inherited_fd(mapping.src, mapping.dst)?;
                 }
@@ -1533,7 +1553,9 @@ fn inherited_fd_source_needs_spare(src: i32, dst: i32) -> bool {
             | microsandbox_runtime::vm::LIFECYCLE_LOCK_FD
     );
     #[cfg(feature = "oci-runtime")]
-    let reserved = reserved || src == microsandbox_runtime::vm::OCI_CONSOLE_FD;
+    let reserved = reserved
+        || src == microsandbox_runtime::vm::OCI_CONSOLE_FD
+        || src == microsandbox_runtime::vm::OCI_STDIN_FD;
     src != dst && reserved
 }
 
