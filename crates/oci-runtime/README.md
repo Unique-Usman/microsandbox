@@ -41,6 +41,14 @@ setup: mountpoints, runtime files, and guest configuration. Before reporting
 ready or starting workloads, it remounts the root overlay read-only. This does
 not require writing to Docker's rootfs or making the host mount writable.
 
+Docker also supplies `/etc/hosts`, `/etc/hostname`, and `/etc/resolv.conf` as
+separate mounts. When those files are read-only, the agent preserves their
+contents instead of trying to regenerate them during initialization. It does
+not remount them writable or replace them. Only an `EROFS` rejection for an
+existing regular file is accepted; missing files, permission errors, and other
+write failures still abort initialization. Writable network files retain the
+existing Microsandbox-generated configuration.
+
 The implementation is in `lib/sandbox.rs`, SDK `runtime/spawn.rs`, runtime
 `runner/vm.rs`, and guest `readonly_root.rs`/`init.rs`. Rebuild the musl guest
 agent and embed it when rebuilding `msb`; rebuilding `runmsb` alone is not enough.
