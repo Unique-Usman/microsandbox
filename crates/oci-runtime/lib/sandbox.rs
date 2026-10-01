@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
-use microsandbox::sandbox::Sandbox;
+use microsandbox::sandbox::{HostPermissions, MountBuilder, Sandbox};
 use microsandbox_runtime::oci::{OciBundle, sandbox_name_for_container};
 
 use crate::console::process_console_size;
@@ -106,8 +106,7 @@ pub(crate) async fn create_sandbox_for_bundle(
                     .iter()
                     .any(|opt| opt == "ro");
                 builder = builder.volume(destination, |mount| {
-                    let mount = mount.bind(source);
-                    if readonly { mount.readonly() } else { mount }
+                    configure_bind_mount(mount, source, readonly)
                 });
             }
             Some("tmpfs") => {
@@ -193,13 +192,65 @@ fn absolutize_mount_source(bundle: &Path, source: &Path) -> PathBuf {
     }
 }
 
+fn configure_bind_mount(mount: MountBuilder, source: PathBuf, readonly: bool) -> MountBuilder {
+    // OCI bind mounts share permission changes with the host, unlike private SDK mounts.
+    let mount = mount.bind(source).host_permissions(HostPermissions::Mirror);
+    if readonly { mount.readonly() } else { mount }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use microsandbox::sandbox::{StatVirtualization, VolumeMount};
+
     use super::*;
+
+    #[test]
+    fn oci_bind_mounts_mirror_host_permissions_and_preserve_readonly() {
+        for readonly in [false, true] {
+            let mount = configure_bind_mount(
+                MountBuilder::new("/data"),
+                PathBuf::from("/host/data"),
+                readonly,
+            )
+            .build()
+            .unwrap();
+            let VolumeMount::Bind {
+                host,
+                guest,
+                options,
+                stat_virtualization,
+                host_permissions,
+                ..
+            } = mount
+            else {
+                panic!("expected bind mount");
+            };
+            assert_eq!(host, PathBuf::from("/host/data"));
+            assert_eq!(guest, "/data");
+            assert_eq!(options.readonly, readonly);
+            assert_eq!(stat_virtualization, StatVirtualization::Strict);
+            assert_eq!(host_permissions, HostPermissions::Mirror);
+        }
+    }
+
+    #[test]
+    fn ordinary_sdk_bind_mounts_keep_private_host_permissions() {
+        let mount = MountBuilder::new("/data")
+            .bind("/host/data")
+            .build()
+            .unwrap();
+        let VolumeMount::Bind {
+            host_permissions, ..
+        } = mount
+        else {
+            panic!("expected bind mount");
+        };
+        assert_eq!(host_permissions, HostPermissions::Private);
+    }
 
     #[test]
     fn resolves_relative_mount_source_against_bundle() {

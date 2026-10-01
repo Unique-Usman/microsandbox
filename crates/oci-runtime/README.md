@@ -17,6 +17,15 @@ controls. Docker network isolation (including `--network none`), read-only
 rootfs, and complete mount flags/ownership semantics also remain incomplete.
 Feature reporting does not advertise unimplemented controls or mount flags.
 
+OCI bind mounts select `HostPermissions::Mirror`: ordinary guest permission bits
+for regular files and directories propagate to the host. For example, a file
+created with mode `0644` is host-readable instead of being stored as `0600`.
+Guest chmod can also change permissions of existing files on the shared mount.
+The backend keeps owner access, does not mirror setuid/setgid bits, and retains
+guest ownership metadata separately; this does not map file ownership to the
+Docker client user. Read-only mounts remain read-only. A guest-created `0600`
+file remains private on the host. The normal SDK default remains `Private`.
+
 Compatibility-only CLI switches remain accepted: `--systemd-cgroup`,
 `--cgroup-manager`, `--rootless`, `--no-pivot`, and `--no-new-keyring`. They do not
 claim implementation of cgroups, rootless execution, or host namespace controls.
