@@ -219,6 +219,11 @@ pub struct SandboxConfig {
     #[serde(skip)]
     pub(crate) snapshot_reference: Option<SnapshotReference>,
 
+    /// Local restore inputs have been classified and anchored for this operation.
+    /// Keep an admitted store name from becoming a file lookup after cwd changes.
+    #[serde(skip)]
+    pub(crate) local_restore_paths_resolved: bool,
+
     /// Immutable installed-snapshot layers to materialize into child-owned root storage.
     ///
     /// Transient: paths remain read-only sources until local create copies or links them and adds
@@ -599,6 +604,7 @@ impl SandboxConfig {
     /// transient launch markers and any workload argv routed through an inherited init are removed.
     pub(crate) fn clone_for_persistence(&self) -> Self {
         let mut config = self.clone();
+        config.local_restore_paths_resolved = false;
         #[cfg(feature = "local")]
         {
             config.checkpoint_restore = None;
@@ -1115,6 +1121,7 @@ impl Default for SandboxConfig {
             slug: None,
             manifest_digest: None,
             snapshot_reference: None,
+            local_restore_paths_resolved: false,
             snapshot_upper_source: None,
             #[cfg(feature = "local")]
             snapshot_root_layer_sources: Vec::new(),
@@ -1939,6 +1946,7 @@ mod tests {
                 log_level: Some(SandboxLogLevel::Trace),
                 metrics_sample_interval_ms: Some(750),
                 disable_metrics_sample: true,
+                guest_clock: Some(microsandbox_types::GuestClockPolicy::Off),
             },
             env: vec![EnvVar::new("A", "B")],
             labels: [("team".to_string(), "infra".to_string())]
@@ -1988,6 +1996,10 @@ mod tests {
         assert_eq!(config.spec.runtime.cmd, Some(vec!["worker.py".to_string()]));
         assert_eq!(config.spec.runtime.hostname.as_deref(), Some("worker"));
         assert_eq!(config.spec.runtime.user.as_deref(), Some("appuser"));
+        assert_eq!(
+            config.spec.runtime.guest_clock,
+            Some(microsandbox_types::GuestClockPolicy::Off)
+        );
         assert_eq!(config.spec.security_profile, SecurityProfile::Restricted);
         assert_eq!(config.spec.lifecycle.max_duration_secs, Some(3600));
         assert_eq!(config.spec.lifecycle.idle_timeout_secs, Some(120));

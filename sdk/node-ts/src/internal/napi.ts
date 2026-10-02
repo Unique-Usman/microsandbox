@@ -50,10 +50,12 @@ export interface NativeBindings {
   readonly InitOptionsBuilder: NapiInitOptionsBuilderCtor;
   readonly AttachOptionsBuilder: NapiAttachOptionsBuilderCtor;
   readonly DnsBuilder: NapiBuilderCtor<NapiDnsBuilder>;
+  readonly HttpBuilder: NapiBuilderCtor<NapiHttpBuilder>;
   readonly TlsBuilder: NapiBuilderCtor<NapiTlsBuilder>;
   readonly SecretBuilder: NapiBuilderCtor<NapiSecretBuilder>;
   readonly NetworkBuilder: NapiBuilderCtor<NapiNetworkBuilder>;
   readonly OutboundProxyBuilder: NapiBuilderCtor<NapiOutboundProxyBuilder>;
+  readonly HttpConnectProxyBuilder: { prototype: NapiHttpConnectProxyBuilder };
   readonly Socks4ProxyBuilder: { prototype: NapiSocks4ProxyBuilder };
   readonly Socks5ProxyBuilder: { prototype: NapiSocks5ProxyBuilder };
   readonly NetworkPolicyBuilder: NapiBuilderCtor<NapiNetworkPolicyBuilder>;
@@ -224,7 +226,7 @@ export interface NapiSandboxBuilderSetters {
   proxy(
     configure: (
       b: NapiOutboundProxyBuilder,
-    ) => NapiSocks4ProxyBuilder | NapiSocks5ProxyBuilder,
+    ) => NapiHttpConnectProxyBuilder | NapiSocks4ProxyBuilder | NapiSocks5ProxyBuilder,
   ): this;
   port(host: number, guest: number): this;
   portBind(bind: string, host: number, guest: number): this;
@@ -279,6 +281,8 @@ export interface NapiRestoreBuilderSetters {
   security(profile: "default" | "restricted"): this;
   maxDuration(secs: number): this;
   idleTimeout(secs: number): this;
+  cowMemory(): this;
+  /** @deprecated Use cowMemory() instead. */
   forked(): this;
   diskOnly(): this;
   snapshotBase(base: string): this;
@@ -292,6 +296,8 @@ export interface NapiRestoreBuilderSetters {
   portBind(bind: string, host: number, guest: number): this;
   portUdp(host: number, guest: number): this;
   portUdpBind(bind: string, host: number, guest: number): this;
+  /** 1..=2147483647; omission keeps the default, 1024. */
+  tcpAcceptQueueSize(size: number): this;
   vsock(path: string, port: number): this;
   vsockDgram(path: string, port: number): this;
 }
@@ -345,7 +351,11 @@ export interface NapiSandbox {
   attachShell(): Promise<number>;
   restoreWarnings(): Promise<Array<{ guestPath: string; reason: string; staleInodes: bigint[] }>>;
   stop(): Promise<void>;
+  fork(name: string, recordIntegrity?: boolean, guestFlush?: string): Promise<NapiSandbox>;
+  /** @deprecated Use fork() instead. */
   branch(name: string, recordIntegrity?: boolean, guestFlush?: string): Promise<NapiSandbox>;
+  forkMany(names: string[], recordIntegrity?: boolean, guestFlush?: string): Promise<{name: string; sandbox?: NapiSandbox; error?: string}[]>;
+  /** @deprecated Use forkMany() instead. */
   branchMany(names: string[], recordIntegrity?: boolean, guestFlush?: string): Promise<{name: string; sandbox?: NapiSandbox; error?: string}[]>;
   pause(guestFlush?: string): Promise<void>;
   resume(): Promise<void>;
@@ -384,7 +394,11 @@ export interface NapiSandboxHandle {
   connectWithTimeout(timeoutMs: number): Promise<NapiSandbox>;
   connectOrStart(detached?: boolean): Promise<NapiSandbox>;
   stop(): Promise<void>;
+  fork(name: string, recordIntegrity?: boolean, guestFlush?: string): Promise<NapiSandbox>;
+  /** @deprecated Use fork() instead. */
   branch(name: string, recordIntegrity?: boolean, guestFlush?: string): Promise<NapiSandbox>;
+  forkMany(names: string[], recordIntegrity?: boolean, guestFlush?: string): Promise<{name: string; sandbox?: NapiSandbox; error?: string}[]>;
+  /** @deprecated Use forkMany() instead. */
   branchMany(names: string[], recordIntegrity?: boolean, guestFlush?: string): Promise<{name: string; sandbox?: NapiSandbox; error?: string}[]>;
   pause(guestFlush?: string): Promise<void>;
   resume(): Promise<void>;
@@ -1012,6 +1026,11 @@ export interface NapiDnsConfig {
   readonly queryTimeoutMs: number;
 }
 
+export interface NapiHttpBuilder {
+  denyResponse(enabled: boolean): this;
+  denyMessage(message: string): this;
+}
+
 export interface NapiTlsBuilder {
   bypass(pattern: string): this;
   verifyUpstream(verify: boolean): this;
@@ -1105,10 +1124,13 @@ export interface NapiNetworkBuilder {
   maxConnections(max: number): this;
   maxTcpConnections(max: number): this;
   maxUdpConnections(max: number): this;
+  tcpAcceptQueueSize(size: number): this;
   strict(enabled: boolean): this;
   ipv4Pool(pool: string): this;
   ipv6Pool(pool: string): this;
+  nat64Prefix(prefix: string): this;
   trustHostCAs(enabled: boolean): this;
+  http(configure: (h: NapiHttpBuilder) => NapiHttpBuilder): this;
   rateLimiter(
     configure: (b: NapiNetworkRateLimiterBuilder) => NapiNetworkRateLimiterBuilder,
   ): this;
@@ -1116,8 +1138,13 @@ export interface NapiNetworkBuilder {
 }
 
 export interface NapiOutboundProxyBuilder {
+  httpConnect(address: string): NapiHttpConnectProxyBuilder;
   socks4(address: string): NapiSocks4ProxyBuilder;
   socks5(address: string): NapiSocks5ProxyBuilder;
+}
+
+export interface NapiHttpConnectProxyBuilder {
+  readonly __httpConnectProxy?: never;
 }
 
 export interface NapiSocks4ProxyBuilder {
