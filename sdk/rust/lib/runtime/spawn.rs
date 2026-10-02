@@ -360,6 +360,9 @@ pub async fn spawn_sandbox(
     if oci_readonly_root(config) {
         launch_contract::require_oci_readonly_root(&resolved_runtime.msb_path).await?;
     }
+    #[cfg(feature = "net")]
+    launch_contract::validate_http_deny_response(&resolved_runtime.msb_path, config).await?;
+    launch_contract::validate_guest_clock(&resolved_runtime.msb_path, config).await?;
     if config.checkpoint_restore.as_ref().is_some_and(|restore| {
         restore
             .external_mounts
@@ -368,6 +371,11 @@ pub async fn spawn_sandbox(
     }) {
         launch_contract::require_restore_backing(&resolved_runtime.msb_path).await?;
     }
+    // Create already probed before replacing; a later start may use a different runtime.
+    #[cfg(feature = "net")]
+    launch_contract
+        .require_network_capabilities(&resolved_runtime.msb_path, resolved_network.config())
+        .await?;
     if launch_contract.patch < 9
         && !matches!(
             global.runtime.block_writeback,
@@ -2991,6 +2999,7 @@ fn machine_cli_args(
         agent_sock: agent_sock_path.to_path_buf(),
         libkrunfw_path: libkrunfw_path.to_path_buf(),
         thp: config.spec.resources.thp,
+        guest_clock: config.spec.runtime.guest_clock.unwrap_or_default(),
         memory_cache_dir: Some(local.cache_dir().join("memory")),
         startup: startup_command(config),
         lifecycle: Lifecycle {
