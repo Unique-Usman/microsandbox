@@ -389,6 +389,25 @@ implements the runc-style command surface it expects.
 Every accepted OCI field should eventually be implemented or rejected explicitly. Parsing a flag
 without applying its semantics must not be presented as security or OCI compliance.
 
+## Docker follow-up checklist
+
+1. **Rerun the complete Docker suite: pending for the latest build.** The
+   earlier full run had 40 passing checks and six known gaps. Five targeted
+   Docker checks passed after the read-only fixes, but the complete suite must
+   run again to check for regressions across all workflows.
+2. **Block external connections with `--network none`: fixed and tested.**
+   Keep this isolation check in the regression suite. This does not imply that
+   all Docker networking features are implemented.
+3. **Support read-only rootfs: implemented and Docker-tested.** Containers
+   start with `--read-only`, root writes fail, and explicitly writable bind
+   mounts and tmpfs remain writable. Docker's read-only network files are
+   preserved, including supplied `--add-host` entries.
+4. **Finish Docker networking: implementation still required.** Add published
+   ports (`-p`), container-to-container communication, and container-name and
+   alias resolution on user-defined networks. Test host-to-container published
+   ports, peer connectivity, name resolution, and isolation between networks.
+   Working outbound connections alone do not demonstrate these features.
+
 ## Decisions requested from maintainers
 
 1. Should we ship `runmsb` as an official binary now, or keep it experimental while
