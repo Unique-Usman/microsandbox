@@ -613,6 +613,9 @@ fn apply_secret_options(
 
 #[derive(Clone)]
 enum RubyOutboundProxyConfig {
+    HttpConnect {
+        address: String,
+    },
     Socks4 {
         address: String,
         user_id: Option<String>,
@@ -625,6 +628,9 @@ enum RubyOutboundProxyConfig {
 
 fn apply_outbound_proxy(builder: SandboxBuilder, proxy: &RubyOutboundProxy) -> SandboxBuilder {
     match proxy.inner.borrow().clone() {
+        RubyOutboundProxyConfig::HttpConnect { address } => {
+            builder.proxy(|proxy| proxy.http_connect(address))
+        }
         RubyOutboundProxyConfig::Socks4 {
             address,
             user_id: Some(user_id),
@@ -780,6 +786,7 @@ fn apply_builder_options(
         "replace_timeout",
         "root_disk",
         "disable_network",
+        "http",
         "network",
         "proxy",
         "secrets",
@@ -858,6 +865,15 @@ fn apply_builder_options(
         } else {
             let policy = restricted_network_policy(ruby, net)?;
             builder = builder.network(|n| n.policy(policy));
+        }
+    }
+    if let Some(http) = keyword::<RHash>(kwargs, "http")? {
+        reject_unknown_keywords(ruby, http, &["deny_response", "deny_message"])?;
+        if let Some(enabled) = keyword::<bool>(http, "deny_response")? {
+            builder = builder.network(|network| network.http(|h| h.deny_response(enabled)));
+        }
+        if let Some(message) = keyword::<String>(http, "deny_message")? {
+            builder = builder.network(|network| network.http(|h| h.deny_message(message)));
         }
     }
     if let Some(proxy) = keyword::<typed_data::Obj<RubyOutboundProxy>>(kwargs, "proxy")? {
@@ -1124,6 +1140,21 @@ impl RubySandboxBuilder {
     }
     fn disable_network(this: typed_data::Obj<Self>) -> Result<(), Error> {
         put_builder(&this, SandboxBuilder::disable_network)
+    }
+    fn http(
+        this: typed_data::Obj<Self>,
+        enabled: Option<bool>,
+        message: Option<String>,
+    ) -> Result<(), Error> {
+        put_builder(&this, |mut builder| {
+            if let Some(enabled) = enabled {
+                builder = builder.network(|network| network.http(|h| h.deny_response(enabled)));
+            }
+            if let Some(message) = message {
+                builder = builder.network(|network| network.http(|h| h.deny_message(message)));
+            }
+            builder
+        })
     }
     fn quiet_logs(this: typed_data::Obj<Self>) -> Result<(), Error> {
         put_builder(&this, SandboxBuilder::quiet_logs)
@@ -2045,6 +2076,12 @@ fn outbound_proxy_socks4(address: String) -> RubyOutboundProxy {
     }
 }
 
+fn outbound_proxy_http_connect(address: String) -> RubyOutboundProxy {
+    RubyOutboundProxy {
+        inner: std::cell::RefCell::new(RubyOutboundProxyConfig::HttpConnect { address }),
+    }
+}
+
 fn outbound_proxy_socks5(address: String) -> RubyOutboundProxy {
     RubyOutboundProxy {
         inner: std::cell::RefCell::new(RubyOutboundProxyConfig::Socks5 {
@@ -2080,6 +2117,10 @@ impl RubyOutboundProxy {
                 ruby,
                 "user_id is only supported for SOCKS4 proxies",
             )),
+            RubyOutboundProxyConfig::HttpConnect { .. } => Err(argument_error(
+                ruby,
+                "user_id is only supported for SOCKS4 proxies",
+            )),
         }
     }
 
@@ -2091,6 +2132,10 @@ impl RubyOutboundProxy {
     ) -> Result<(), Error> {
         match &mut *this.inner.borrow_mut() {
             RubyOutboundProxyConfig::Socks4 { .. } => Err(argument_error(
+                ruby,
+                "credentials are only supported for SOCKS5 proxies",
+            )),
+            RubyOutboundProxyConfig::HttpConnect { .. } => Err(argument_error(
                 ruby,
                 "credentials are only supported for SOCKS5 proxies",
             )),
@@ -2615,6 +2660,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     secret_source.define_singleton_method("env", function!(secret_source_env, 1))?;
 
     let outbound_proxy = module.define_class("OutboundProxy", ruby.class_object())?;
+    outbound_proxy
+        .define_singleton_method("http_connect", function!(outbound_proxy_http_connect, 1))?;
     outbound_proxy.define_singleton_method("socks4", function!(outbound_proxy_socks4, 1))?;
     outbound_proxy.define_singleton_method("socks5", function!(outbound_proxy_socks5, 1))?;
     outbound_proxy.define_method("user_id!", method!(RubyOutboundProxy::user_id, 1))?;
@@ -2757,6 +2804,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "disable_network!",
         method!(RubySandboxBuilder::disable_network, 0),
     )?;
+    builder.define_method("http!", method!(RubySandboxBuilder::http, 2))?;
     builder.define_method("quiet_logs!", method!(RubySandboxBuilder::quiet_logs, 0))?;
     builder.define_method("entrypoint!", method!(RubySandboxBuilder::entrypoint, 1))?;
     builder.define_method("init!", method!(RubySandboxBuilder::init, 1))?;

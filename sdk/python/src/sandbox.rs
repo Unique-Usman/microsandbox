@@ -34,8 +34,8 @@ pub struct PySandbox {
 }
 
 /// One child outcome from a capture-once batch.
-#[pyclass(name = "BranchOutcome", get_all, frozen)]
-pub struct PyBranchOutcome {
+#[pyclass(name = "ForkOutcome", get_all, frozen)]
+pub struct PyForkOutcome {
     name: String,
     sandbox: Option<Py<PySandbox>>,
     error: Option<Py<PyAny>>,
@@ -977,7 +977,10 @@ impl PySandbox {
     #[pyo3(signature = (interval = 1.0))]
     fn metrics_stream<'py>(&self, py: Python<'py>, interval: f64) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let interval_dur = std::time::Duration::from_secs_f64(interval);
+        let interval_dur = optional_duration(Some(interval))?.unwrap();
+        if interval_dur.is_zero() {
+            return Err(PyValueError::new_err("metrics interval must be positive"));
+        }
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let sandbox = Self::clone_sandbox(&inner).await?;
             let stream = sandbox.metrics_stream(interval_dur);
@@ -1082,9 +1085,49 @@ impl PySandbox {
         self.stop(py, Some(timeout))
     }
 
-    /// Create an independent local CoW child without a durable full snapshot.
+    /// Deprecated: use fork for live execution duplication.
     #[pyo3(signature = (name, *, record_integrity = false, guest_flush = None))]
     fn branch<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        record_integrity: bool,
+        guest_flush: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        PyModule::import(py, "warnings")?.call_method1(
+            "warn",
+            (
+                "branch is deprecated; use fork",
+                py.get_type::<pyo3::exceptions::PyDeprecationWarning>(),
+                2,
+            ),
+        )?;
+        self.fork(py, name, record_integrity, guest_flush)
+    }
+
+    /// Deprecated: use fork_many for live execution duplication.
+    #[pyo3(signature = (names, *, record_integrity = false, guest_flush = None))]
+    fn branch_many<'py>(
+        &self,
+        py: Python<'py>,
+        names: Vec<String>,
+        record_integrity: bool,
+        guest_flush: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        PyModule::import(py, "warnings")?.call_method1(
+            "warn",
+            (
+                "branch_many is deprecated; use fork_many",
+                py.get_type::<pyo3::exceptions::PyDeprecationWarning>(),
+                2,
+            ),
+        )?;
+        self.fork_many(py, names, record_integrity, guest_flush)
+    }
+
+    /// Create an independent local CoW child without a durable full snapshot.
+    #[pyo3(signature = (name, *, record_integrity = false, guest_flush = None))]
+    fn fork<'py>(
         &self,
         py: Python<'py>,
         name: String,
@@ -1095,20 +1138,20 @@ impl PySandbox {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let sandbox = Self::clone_sandbox(&inner).await?;
             let mut builder = sandbox
-                .branch(name)
+                .fork(name)
                 .guest_flush(crate::snapshot::guest_flush_policy(guest_flush)?);
             if record_integrity {
                 builder = builder.record_integrity();
             }
             Ok(PySandbox::from_rust(
-                builder.branch().await.map_err(to_py_err)?,
+                builder.fork().await.map_err(to_py_err)?,
             ))
         })
     }
 
     /// Capture once for all names; return an outcome for each child in input order.
     #[pyo3(signature = (names, *, record_integrity = false, guest_flush = None))]
-    fn branch_many<'py>(
+    fn fork_many<'py>(
         &self,
         py: Python<'py>,
         names: Vec<String>,
@@ -1119,12 +1162,12 @@ impl PySandbox {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let sandbox = Self::clone_sandbox(&inner).await?;
             let mut builder = sandbox
-                .branch_many(names)
+                .fork_many(names)
                 .guest_flush(crate::snapshot::guest_flush_policy(guest_flush)?);
             if record_integrity {
                 builder = builder.record_integrity();
             }
-            branch_outcomes(builder.branch().await.map_err(to_py_err)?)
+            branch_outcomes(builder.fork().await.map_err(to_py_err)?)
         })
     }
 
@@ -2016,10 +2059,7 @@ fn validate_rlimit_resource(resource: &str) -> PyResult<()> {
 }
 
 fn validate_timeout(timeout_secs: Option<f64>) -> PyResult<()> {
-    if timeout_secs.is_some_and(|timeout| timeout < 0.0) {
-        return Err(PyValueError::new_err("timeout must be non-negative"));
-    }
-    Ok(())
+    optional_duration(timeout_secs).map(|_| ())
 }
 
 fn required_from_dict<'py, T: FromPyObject<'py>>(
@@ -2439,8 +2479,8 @@ fn convert_pull_progress(event: microsandbox::sandbox::PullProgress) -> PyPullEv
 //--------------------------------------------------------------------------------------------------
 
 pub(crate) fn branch_outcomes(
-    outcomes: Vec<microsandbox::sandbox::BranchOutcome>,
-) -> PyResult<Vec<PyBranchOutcome>> {
+    outcomes: Vec<microsandbox::sandbox::ForkOutcome>,
+) -> PyResult<Vec<PyForkOutcome>> {
     Python::with_gil(|py| {
         outcomes
             .into_iter()
@@ -2449,7 +2489,7 @@ pub(crate) fn branch_outcomes(
                     Ok(child) => (Some(Py::new(py, PySandbox::from_rust(child))?), None),
                     Err(error) => (None, Some(to_py_err(error).into_value(py).into_any())),
                 };
-                Ok(PyBranchOutcome {
+                Ok(PyForkOutcome {
                     name: outcome.name,
                     sandbox,
                     error,
@@ -2482,6 +2522,16 @@ mod tests {
     use microsandbox::sandbox::{SecretModificationPatch, SecretSource};
 
     use super::*;
+
+    #[test]
+    fn execution_timeouts_reject_non_finite_and_overflowing_values() {
+        pyo3::prepare_freethreaded_python();
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, f64::MAX] {
+            assert!(validate_timeout(Some(value)).is_err());
+        }
+        assert!(validate_timeout(Some(0.5)).is_ok());
+        assert!(validate_timeout(Some(0.0)).is_ok());
+    }
 
     #[test]
     fn explicit_stop_duration_preserves_zero_and_fractional_seconds() {

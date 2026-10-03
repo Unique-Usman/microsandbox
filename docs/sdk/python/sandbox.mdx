@@ -24,6 +24,33 @@ Use `connect_or_create` when a named sandbox might already exist. It connects to
 
 Lifecycle methods on a `Sandbox` or `SandboxHandle` stay attached to its opaque `id`. If the name is removed and reused, an old receiver raises `SandboxReplacedError` instead of acting on the replacement. See [Reuse or create a named sandbox](/sandboxes/lifecycle#reuse-or-create-a-named-sandbox) for examples.
 
+## Forking
+
+Forking duplicates a running or paused local sandbox without saving a reusable snapshot. It shares memory through copy-on-write, keeps child writes private, and returns the source to its previous state. These methods are available on both `Sandbox` and `SandboxHandle`. Each child requires an unused name. See [forking](/sandboxes/snapshots#forking) for examples, resource bindings, and backend limits.
+
+### fork() and fork_many()
+
+```python
+async def fork(self, name: str, *, record_integrity: bool = False,
+               guest_flush: GuestFlush | None = None) -> Sandbox: ...
+async def fork_many(self, names: list[str], *, record_integrity: bool = False,
+                    guest_flush: GuestFlush | None = None) -> list[ForkOutcome]: ...
+```
+
+`record_integrity` records disk hashes. `guest_flush` accepts `GuestFlush.AUTO`, `REQUIRED`, or `SKIP`; omitting it uses `AUTO`. Import `GuestFlush` from `microsandbox`.
+
+### ForkOutcome
+
+| Property | Meaning |
+| --- | --- |
+| `name` | Requested child name |
+| `sandbox` | Started `Sandbox`, or `None` on failure |
+| `error` | Exception on failure, or `None` on success |
+
+`branch()` and `branch_many()` remain deprecated aliases and emit `DeprecationWarning`. `BranchOutcome` aliases `ForkOutcome`.
+
+Batch results follow input order. Validation or capture failures fail the whole call; an individual startup failure appears in that child's outcome, and successful siblings remain available. Stop successful children explicitly when finished.
+
 ## Sandbox
 
 <p className="msb-member-group">Instance properties</p>
@@ -1817,8 +1844,8 @@ The keyword arguments accepted by [`create()`](#sandbox-create) and [`create_wit
 | init | `str \| `[`InitConfig`](#initconfig)` \| `[`InitOptions`](#initoptions) | - | Hand off PID 1 to a guest init binary. See [Custom init system](/sandboxes/bootstrap#custom-init-system) and [`InitConfig`](#initconfig) for accepted shapes |
 | replace | `bool` | `False` | Replace an existing sandbox with the same name (10s SIGTERM grace, then SIGKILL) |
 | replace_with_timeout | `float` | `10` | Seconds to wait after `SIGTERM` before escalating to `SIGKILL` (`0` skips `SIGTERM`). Implies `replace=True` |
-| max_duration | `float` | - | Maximum sandbox lifetime in seconds |
-| idle_timeout | `float` | - | Idle timeout in seconds |
+| max_duration | `float` | - | Maximum sandbox lifetime in seconds; finite and non-negative, rounded up to whole seconds |
+| idle_timeout | `float` | - | Idle timeout in seconds; finite and non-negative, rounded up to whole seconds |
 | ephemeral | `bool` | `False` | If `True`, the sandbox and all its persisted state are removed automatically once it stops, rather than left on disk for restart |
 | env | `Mapping[str, str]` | `{}` | Environment variables visible to all commands |
 | labels | `Mapping[str, str]` | `{}` | User-defined labels attached to the sandbox. Filter with [`list_with()`](#sandbox-list_with); see [Select in bulk](/sandboxes/labels#select-in-bulk). Keys starting with `sandbox.`, `microsandbox.`, or `service.` are reserved and rejected |

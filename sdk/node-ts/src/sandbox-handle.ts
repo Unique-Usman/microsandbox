@@ -1,3 +1,4 @@
+import { remapKeysToCamel } from "./internal/config.js";
 import { mapNapiError, withMappedErrors } from "./internal/error-mapping.js";
 import { validateStopTimeout } from "./internal/stop.js";
 import {
@@ -35,6 +36,7 @@ import {
 import type { SandboxStatus } from "./sandbox-status.js";
 import type { SandboxMetrics } from "./metrics.js";
 import { Snapshot } from "./snapshot.js";
+import { storageUsageFromHandle, type StorageItemUsage } from "./storage.js";
 
 export interface SandboxStopResult {
   readonly name: string;
@@ -82,6 +84,11 @@ export class SandboxHandle {
   async refresh(): Promise<SandboxHandle> {
     const raw = await withMappedErrors(() => this.inner.refresh());
     return new SandboxHandle(raw);
+  }
+
+  /** Observe the managed sandbox directory using this handle's captured backend. */
+  async storageUsage(): Promise<StorageItemUsage> {
+    return storageUsageFromHandle(this.inner, "SandboxHandle.storageUsage()");
   }
 
   /** Get point-in-time metrics. */
@@ -187,15 +194,25 @@ export class SandboxHandle {
     await withMappedErrors(() => this.inner.stop());
   }
 
-  /** Create an independent local CoW child without a durable full snapshot. */
+  /** @deprecated Use fork() for live execution duplication. */
   async branch(name: string, options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<Sandbox> {
-    const child = await withMappedErrors(() => this.inner.branch(name, options.recordIntegrity, options.guestFlush));
+    return this.fork(name, options);
+  }
+
+  /** @deprecated Use forkMany() for capture-once live duplication. */
+  async branchMany(names: string[], options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<import("./sandbox.js").ForkOutcome[]> {
+    return this.forkMany(names, options);
+  }
+
+  /** Create an independent local CoW child without a durable full snapshot. */
+  async fork(name: string, options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<Sandbox> {
+    const child = await withMappedErrors(() => this.inner.fork(name, options.recordIntegrity, options.guestFlush));
     return new Sandbox(child, name, false);
   }
 
   /** Capture once; return each named child's startup outcome in input order. */
-  async branchMany(names: string[], options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<import("./sandbox.js").BranchOutcome[]> {
-    const outcomes = await withMappedErrors(() => this.inner.branchMany(names, options.recordIntegrity, options.guestFlush));
+  async forkMany(names: string[], options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<import("./sandbox.js").ForkOutcome[]> {
+    const outcomes = await withMappedErrors(() => this.inner.forkMany(names, options.recordIntegrity, options.guestFlush));
     return outcomes.map(o => o.sandbox
       ? { name: o.name, sandbox: new Sandbox(o.sandbox, o.name, false) }
       : { name: o.name, error: mapNapiError(new Error(o.error ?? "Child startup failed")) as Error });
@@ -334,18 +351,4 @@ function sandboxStopResultFromNapi(result: {
     observedAt: new Date(result.observedAt),
     source: result.source ?? null,
   };
-}
-
-function remapKeysToCamel(v: any): any {
-  if (Array.isArray(v)) return v.map(remapKeysToCamel);
-  if (v && typeof v === "object" && v.constructor === Object) {
-    const out: any = {};
-    for (const [k, val] of Object.entries(v)) out[snakeToCamel(k)] = remapKeysToCamel(val);
-    return out;
-  }
-  return v;
-}
-
-function snakeToCamel(s: string): string {
-  return s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 }
