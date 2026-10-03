@@ -12,7 +12,7 @@ pub(crate) fn oci_features_json() -> serde_json::Value {
         "mountOptions": [],
         "linux": {
             "namespaces": [],
-            "capabilities": [],
+            "capabilities": microsandbox_protocol::exec::EXEC_CAPABILITY_NAMES,
             "cgroup": {
                 "v1": false,
                 "v2": false,
@@ -54,6 +54,13 @@ mod tests {
         assert!(features["hooks"].is_array());
         assert!(features["mountOptions"].as_array().unwrap().is_empty());
         assert_eq!(features["linux"]["seccomp"]["enabled"], false);
+        assert!(
+            features["linux"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cap| cap == "CAP_CHOWN")
+        );
         assert_eq!(
             features["annotations"]["org.opencontainers.runmsb.version"],
             env!("CARGO_PKG_VERSION")

@@ -8,6 +8,7 @@ mod process;
 mod requests;
 mod runtime;
 mod sandbox;
+mod security;
 
 //--------------------------------------------------------------------------------------------------
 // Re-Exports

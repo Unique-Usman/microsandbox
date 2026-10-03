@@ -104,6 +104,11 @@ pub struct MetricsSlotHandoff {
 /// User workload that the sandbox process should start after boot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StartupCommand {
+    /// OCI workload security settings for the embedded guest agent.
+    #[cfg(feature = "oci-runtime")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<microsandbox_protocol::exec::ExecSecurity>,
+
     /// Path or command name to execute inside the guest.
     pub cmd: String,
 

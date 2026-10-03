@@ -8,6 +8,7 @@
 
 mod config;
 mod error;
+mod exec_security;
 mod mount_checkpoint;
 mod readonly_root;
 mod rlimit;

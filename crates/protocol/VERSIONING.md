@@ -59,6 +59,15 @@ Generation labels must be checked against actual historical agents. The current 
 
 ### Bootstrap and shutdown
 
+The current OCI implementation adds an optional `security` field to
+`core.exec.request`: `no_new_privileges` plus five named capability sets.
+Absent settings retain ordinary execution; explicit empty sets drop all
+capabilities. This OCI feature targets matching current `runmsb`, `msb`, and
+embedded agentd builds, by explicit contribution scope. It does not add a
+legacy security adapter or claim enforcement by older agents, which can ignore
+the field. Recreate VMs after rebuilding the embedded agent. Existing protocol
+generations, framing, and unrelated compatibility paths are unchanged.
+
 `core.bootstrap` is a one-shot startup frame sent before the ordinary `core.ready` exchange. It configures a newly launched VM with the agent bundled by the selected build. The guest validates its minimum generation and accepts newer bootstrap generations under the existing optional-field rules. This is distinct from connecting a new SDK to an already-running old VM, and it does not prove compatibility of the host SDK/runtime launch JSON or shared database.
 
 OCI read-only roots use the required `block_root.kind = "read-only-virtiofs"`

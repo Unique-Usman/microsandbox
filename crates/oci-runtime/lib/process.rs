@@ -82,8 +82,11 @@ pub(crate) async fn start_process_stream(
     rootfs: &Path,
 ) -> Result<(StartedProcess, ExecHandle)> {
     let command = resolve_process_command(process, rootfs)?;
+    let security = crate::security::process_security(process)?;
     let mut handle = sandbox
-        .exec_stream_with(command, |exec| configure_exec(exec, process))
+        .exec_stream_with(command, |exec| {
+            configure_exec(exec, process).oci_security(security)
+        })
         .await?;
     let _session_id = handle
         .id()

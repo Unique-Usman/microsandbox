@@ -166,6 +166,7 @@ async fn run_startup_command_inner(
         .map_err(|err| RuntimeError::Custom(format!("startup command connect: {err}")))?;
 
     let request = ExecRequest {
+        security: command.security,
         cmd: command.cmd,
         args: command.args,
         env: command.env,

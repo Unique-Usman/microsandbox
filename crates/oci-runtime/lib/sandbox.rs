@@ -71,6 +71,10 @@ pub(crate) async fn create_sandbox_for_bundle(
     }
 
     if let Some(process) = process {
+        builder = builder.label(
+            crate::security::SECURITY_LABEL,
+            serde_json::to_string(&crate::security::process_security(process)?)?,
+        );
         builder = builder.background_command(process_args(process)?.iter().cloned());
         let cwd = process.cwd().display().to_string();
         builder = builder.label(OCI_STARTUP_CWD_LABEL, cwd.clone());

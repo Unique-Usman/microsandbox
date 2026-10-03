@@ -628,6 +628,10 @@ pub async fn spawn_sandbox(
         #[cfg(windows)]
         startup_pipe_name,
     );
+    #[cfg(feature = "oci-runtime")]
+    if let Some(startup) = launch.startup.as_mut() {
+        startup.security = oci_process_security(config)?;
+    }
     tracing::debug!(
         per_disk_limit_bytes = ?writeback_limit_bytes,
         pool_bytes = ?writeback_pool_bytes,
@@ -3421,9 +3425,23 @@ pub(super) fn oci_readonly_root(config: &SandboxConfig) -> bool {
         .is_some_and(|value| value == "true")
 }
 
+#[cfg(feature = "oci-runtime")]
+fn oci_process_security(
+    config: &SandboxConfig,
+) -> MicrosandboxResult<Option<microsandbox_protocol::exec::ExecSecurity>> {
+    config
+        .spec
+        .labels
+        .get("oci.microsandbox.process_security")
+        .map(|json| serde_json::from_str(json).map_err(Into::into))
+        .transpose()
+}
+
 fn startup_command(config: &SandboxConfig) -> Option<StartupCommand> {
     let (cmd, cmd_args) = resolve_startup_command(config)?;
     Some(StartupCommand {
+        #[cfg(feature = "oci-runtime")]
+        security: None,
         cmd,
         args: cmd_args,
         env: config
@@ -4928,6 +4946,33 @@ mod tests {
 
         assert!(rendered.contains(&"--startup-cmd=/entrypoint".to_string()));
         assert!(rendered.contains(&"--startup-arg=bash".to_string()));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "oci-runtime")]
+    async fn oci_security_label_is_typed_and_invalid_settings_are_not_ignored() {
+        let mut config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .label(
+                "oci.microsandbox.process_security",
+                r#"{"no_new_privileges":true,"capabilities":{}}"#,
+            )
+            .build()
+            .await
+            .unwrap();
+        let security = super::oci_process_security(&config).unwrap().unwrap();
+        assert!(security.no_new_privileges);
+        assert_eq!(security.capabilities, Some(Default::default()));
+        config
+            .spec
+            .labels
+            .insert("oci.microsandbox.process_security".into(), "invalid".into());
+        assert!(super::oci_process_security(&config).is_err());
+        config
+            .spec
+            .labels
+            .remove("oci.microsandbox.process_security");
+        assert!(super::oci_process_security(&config).unwrap().is_none());
     }
 
     #[tokio::test]

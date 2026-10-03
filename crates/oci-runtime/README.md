@@ -10,12 +10,56 @@ fields remain implementation work where their semantics are not yet supported.
 The existing bundle validation still rejects malformed configurations, and
 unsupported commands and CLI operations return explicit errors.
 
-Acceptance does not mean enforcement. Do not rely on OCI capabilities, seccomp,
-AppArmor/SELinux, no-new-privileges, cgroup limits, or full namespace isolation in
+Acceptance does not mean enforcement. Do not rely on seccomp,
+AppArmor/SELinux, cgroup limits, or full namespace isolation in
 this experimental runtime. VM isolation does not replace those requested
 controls. Full Docker bridge networking and complete mount
 flags/ownership semantics also remain incomplete.
 Feature reporting does not advertise unimplemented controls or mount flags.
+
+### Guest process security
+
+OCI `process.noNewPrivileges` and the bounding, effective, permitted,
+inheritable, and ambient capability sets are forwarded to agentd. They apply
+to container init and `docker exec`, with both pipes and terminals. Agentd
+validates capability names and set relationships before spawning. In the child,
+it drops bounding capabilities before changing user, applies the final sets
+after user and resource-limit setup, and sets no-new-privileges before exec.
+Setup failures abort execution instead of running an unrestricted workload.
+Agentd itself retains the privileges needed to manage the VM.
+
+`--cap-drop ALL` supplies empty sets, including an empty bounding set so root
+cannot regain those capabilities through ordinary exec. A missing capability
+configuration is different: it retains the existing sandbox behavior. The
+Microsandbox restricted profile still removes mount-administration privileges;
+per-command settings do not override that policy. Linux's ordinary capability
+transition rules still apply when executing setuid or file-capability binaries.
+
+These additions target matching current `runmsb`, `msb`, and embedded agentd
+builds. Rebuild the guest agent, embed it into `msb`, install both host binaries,
+and recreate containers. There is no compatibility implementation for these
+new settings on older builds; an old agent can ignore the added request fields.
+Do not use mixed builds to rely on these protections. Existing compatibility
+code for unrelated SDK/runtime operations is unchanged.
+
+After installing matching builds, check both init and exec:
+
+```bash
+docker run --rm --runtime runmsb --security-opt no-new-privileges \
+  alpine grep NoNewPrivs /proc/self/status
+docker run --rm --runtime runmsb --cap-drop ALL \
+  alpine grep '^Cap' /proc/self/status
+docker run -d --name msb-security-check --runtime runmsb \
+  --cap-drop ALL --security-opt no-new-privileges alpine sleep 300
+docker exec msb-security-check sh -c 'grep -E "^(Cap|NoNewPrivs)" /proc/self/status'
+docker stop msb-security-check
+docker rm msb-security-check
+```
+
+Expect `NoNewPrivs: 1` and zero values for all five `Cap*` sets. Run the
+exec check with `docker exec -t` as well to exercise the terminal path.
+
+### Bind mounts
 
 OCI bind mounts select `HostPermissions::Mirror`: ordinary guest permission bits
 for regular files and directories propagate to the host. For example, a file
@@ -56,8 +100,8 @@ The SDK checks the selected `msb` capability, and a distinct required bootstrap
 variant makes older agents reject the mode. There is no writable fallback.
 Normal writable roots keep their existing boot path.
 
-This implements filesystem write protection, not the still-missing capability
-or security-policy enforcement. In particular, a guest process with mount
+This implements filesystem write protection, not complete security-policy
+enforcement. In particular, a guest process explicitly granted mount
 privileges must not be treated as unable to remount guest filesystems. The host
 rootfs export itself remains read-only.
 
@@ -362,8 +406,18 @@ implements the runc-style command surface it expects.
 ## Current gaps
 
 - OCI hooks are not executed.
-- Cgroups and resource updates are not implemented.
-- Capabilities, seccomp, AppArmor, SELinux, and complete namespace semantics are not applied.
+- Cgroups and resource updates are not implemented. In particular, Docker's
+  `--pids-limit` is accepted but not enforced: a test with a limit of 16 still
+  started 24 child processes. A guest workload cgroup needs to count and limit
+  guest processes; limiting host VMM threads is not equivalent.
+- Seccomp, AppArmor, SELinux, and complete namespace semantics are not applied.
+  Capability sets and no-new-privileges now have guest child-process enforcement;
+  they do not implement the remaining security controls.
+- The OCI hostname is not forwarded to the sandbox. Docker's `--hostname`
+  is ignored, and the generated guest hostname can contain a 64-character
+  label. Python's default HTTP server can fail with `UnicodeError: label too
+  long` when resolving it. Forward and validate the requested hostname and
+  keep generated fallback labels within the 63-character DNS label limit.
 - `kill --all`, `update`, and checkpoint/restore are unsupported.
 - Pause/resume suspends the whole VM while retaining its RAM and host PID. It uses the
   existing Microsandbox pause implementation, not a new OCI cgroup freezer. State queries
@@ -377,7 +431,10 @@ implements the runc-style command surface it expects.
   The startup supervisor forwards input after `ExecStarted` and sends EOF only
   after the inherited input reaches EOF. Install matching `runmsb` and `msb`
   builds when changing this descriptor contract.
-- Docker bridge networking and published ports are incomplete.
+- Docker bridge networking and published ports are incomplete. Container-name
+  resolution on user-defined networks fails. Published-port access also fails
+  with a working guest HTTP server, so fixing the hostname alone will not fix
+  ingress. Outbound DNS/TCP success does not establish Docker network support.
 - State/shim restart recovery has not been tested.
 - OCI runtime-tools and containerd conformance suites have not been added.
 - Start, signal, session, and exit handoff still use polled files; a future VMM control API should
@@ -391,10 +448,13 @@ without applying its semantics must not be presented as security or OCI complian
 
 ## Docker follow-up checklist
 
-1. **Rerun the complete Docker suite: pending for the latest build.** The
-   earlier full run had 40 passing checks and six known gaps. Five targeted
-   Docker checks passed after the read-only fixes, but the complete suite must
-   run again to check for regressions across all workflows.
+1. **Rerun the complete Docker suite: completed on 2026-10-02.** The run against
+   the installed build from commit `297c05fe` had 41 passing checks and five
+   then-known gaps: no-new-privileges, capability dropping, PID limits, user-defined
+   network DNS, and published ports. Additional checks passed for interactive
+   stdin, read-only root with writable tmpfs, and read-only root with a writable
+   bind mount. These results are not OCI conformance or security certification;
+   rerun the suite after subsequent changes.
 2. **Block external connections with `--network none`: fixed and tested.**
    Keep this isolation check in the regression suite. This does not imply that
    all Docker networking features are implemented.

@@ -19,6 +19,10 @@ use microsandbox_types::EnvVar;
 /// Options for command execution (everything except the command itself).
 #[derive(Debug, Clone, Default)]
 pub struct ExecOptions {
+    /// OCI guest workload restrictions. Requires matching host and guest builds.
+    #[cfg(feature = "oci-runtime")]
+    pub security: Option<microsandbox_protocol::exec::ExecSecurity>,
+
     /// Arguments.
     pub args: Vec<String>,
 
@@ -155,6 +159,13 @@ pub struct ExecSink {
 //--------------------------------------------------------------------------------------------------
 
 impl ExecOptionsBuilder {
+    /// Apply OCI security settings to this guest command.
+    #[cfg(feature = "oci-runtime")]
+    pub fn oci_security(mut self, security: microsandbox_protocol::exec::ExecSecurity) -> Self {
+        self.options.security = Some(security);
+        self
+    }
+
     /// Prepend arguments resolved by a higher-level execution helper.
     pub(crate) fn prepend_args(mut self, args: impl IntoIterator<Item = String>) -> Self {
         self.options.args.splice(0..0, args);
@@ -568,6 +579,8 @@ pub(crate) mod agent {
     ) -> MicrosandboxResult<ExecHandle> {
         let client = Arc::new(super::super::fs::agent::connect_agent(backend, name).await?);
         let ExecOptions {
+            #[cfg(feature = "oci-runtime")]
+            security,
             args,
             cwd,
             user,
@@ -590,6 +603,8 @@ pub(crate) mod agent {
         let req = build_exec_request(
             config, cmd, args, cwd, user, &env, &rlimits, tty, rows, cols,
         );
+        #[cfg(feature = "oci-runtime")]
+        let req = microsandbox_protocol::exec::ExecRequest { security, ..req };
         let (id, rx) = client.stream(MessageType::ExecRequest, &req).await?;
 
         let stdin = match &stdin_mode {
