@@ -259,7 +259,7 @@ impl LocalBackend {
         // Archive metadata supplies effective runtime requirements; validating the
         // builder alone misses those. Publication below is a rename, not another copy.
         let mut archive_stage = None;
-        if let Some(archive) = config.snapshot_archive_source.take() {
+        if let Some(archive) = config.snapshot_archive_source.clone() {
             tokio::fs::create_dir_all(self.sandboxes_dir()).await?;
             let stage = tempfile::Builder::new()
                 .prefix(".archive-restore-")
@@ -283,6 +283,8 @@ impl LocalBackend {
                 config.spec.runtime.user = materialized.manifest.restore_defaults()?.user;
             }
             crate::sandbox::apply_snapshot_guest_clock(&mut config, &materialized.manifest)?;
+            crate::sandbox::require_recorded_mounts(&config, &materialized.manifest)?;
+            crate::sandbox::require_guest_mounts(&config, materialized.required_bind_paths)?;
             config.snapshot_parent = Some(materialized.manifest.snapshot_id.to_string());
             crate::snapshot::apply_additional_disks(&mut config, materialized.disk_mounts);
             config.manifest_digest = Some(materialized.manifest.image.manifest_digest.clone());
@@ -309,6 +311,7 @@ impl LocalBackend {
                 let closure = microsandbox_image::checkpoint::CheckpointClosure::open(
                     &restore.closure,
                     Some(&expected),
+                    self.config().fs_state_limit(),
                 )
                 .map_err(|error| crate::MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
                 let overrides = config.restore_overrides;
@@ -336,8 +339,18 @@ impl LocalBackend {
                         }
                     }));
             }
+            // Archive descriptors are resolved here, after the builder's initial validation.
+            // Do not let a disk archive turn an explicit CoW restore into a fresh boot, and
+            // reject it before replacement can remove the existing sandbox.
+            if config.forked && config.checkpoint_restore.is_none() {
+                return Err(crate::MicrosandboxError::InvalidConfig(
+                    "copy-on-write memory requires a full snapshot restore".into(),
+                ));
+            }
+
             // Archive metadata is now available. Check policy against captured state
-            // before admitting it or touching the replacement target.
+            // before admitting it or touching the replacement target. The archive path
+            // stays set so this check sees a disk-only restore's snapshot source.
             config = SandboxBuilder::from(config).finish(Some(&self.config), None)?;
             // Keep launch-time restore intent in this check, not just cold-start state.
             launch_contract::validate_runtime_config(&config, self.config()).await?;
@@ -398,6 +411,7 @@ impl LocalBackend {
                         &sandbox_dir,
                         &root_layout,
                         &config.restore_resources,
+                        self.config().fs_state_limit(),
                     )
                     .await?;
                     config.checkpoint_restore = Some(materialized.restore);
@@ -411,6 +425,7 @@ impl LocalBackend {
                         &sandbox_dir,
                         &root_layout,
                         &config.restore_resources,
+                        self.config().fs_state_limit(),
                     )
                     .await?;
                     crate::snapshot::apply_additional_disks(&mut config, materialized.disk_mounts);
@@ -438,13 +453,6 @@ impl LocalBackend {
             super::super::host_paths::check_bind_roots_do_not_follow_symlinks(&config)?;
         }
 
-        // Archive descriptors are resolved here, after the builder's initial validation.
-        // Do not let a disk archive turn an explicit CoW restore into a fresh boot.
-        if config.forked && config.checkpoint_restore.is_none() {
-            return Err(crate::MicrosandboxError::InvalidConfig(
-                "copy-on-write memory requires a full snapshot restore".into(),
-            ));
-        }
         if !installed_file_sources.is_empty() {
             child_stage_guard = Some(ChildStageGuard::new(sandbox_dir.clone()));
             let virtual_size = installed_file_virtual_size.ok_or_else(|| {
@@ -1314,6 +1322,7 @@ impl LocalBackend {
                             t: chrono::Utc::now()
                                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                             stage: microsandbox_runtime::boot_error::BootErrorStage::Other,
+                            reason: None,
                             errno: None,
                             message: format!(
                                 "sandbox process exited ({status}) before agent relay became available"
