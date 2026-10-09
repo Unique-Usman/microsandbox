@@ -6245,6 +6245,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "runmsb"
+version = "0.7.11"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "libc",
+ "microsandbox",
+ "microsandbox-protocol",
+ "microsandbox-runtime",
+ "nix 0.31.3",
+ "oci-spec",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "russh"
 version = "0.65.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

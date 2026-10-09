@@ -9,7 +9,9 @@
 mod config;
 mod error;
 mod exec_output;
+mod exec_security;
 mod mount_checkpoint;
+mod readonly_root;
 mod rlimit;
 mod root_disk;
 mod workload;
