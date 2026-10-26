@@ -6,15 +6,16 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 
 use microsandbox_agent_client::{
-    AgentClient, ClientResult, ErrorKind as ClientErrorKind, TypedMessage,
+    AgentClient, ClientResult, ErrorKind as ClientErrorKind, OutputAcknowledgements, TypedMessage,
 };
 #[cfg(feature = "net")]
 use microsandbox_network::network::NetworkActivationHandle;
 use microsandbox_protocol::{
     exec::{
-        ExecExited, ExecFailed, ExecRequest, ExecResize, ExecSignal, ExecStderr, ExecStdin,
-        ExecStdout,
+        ExecExited, ExecFailed, ExecLimits, ExecOutputAck, ExecRequest, ExecResize, ExecSignal,
+        ExecStderr, ExecStdin, ExecStdinAck, ExecStdout,
     },
+    isolation::IsolatedExecRequest,
     message::MessageType,
 };
 #[cfg(unix)]
@@ -71,6 +72,46 @@ enum StartupInput {
 struct PtySize {
     rows: u16,
     cols: u16,
+}
+
+/// Input allowance shared by pipe and terminal forwarding for one startup session.
+struct StartupInputWindow {
+    policy: Option<ExecLimits>,
+    sent: u64,
+    consumed: u64,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl StartupInputWindow {
+    fn capacity(&self, buffer_size: usize) -> usize {
+        self.policy.map_or(buffer_size, |policy| {
+            let remaining = u64::from(policy.input_limit) - (self.sent - self.consumed);
+            buffer_size
+                .min(policy.stdin_chunk_size as usize)
+                .min(remaining as usize)
+        })
+    }
+
+    fn sent(&mut self, bytes: usize) -> RuntimeResult<()> {
+        self.sent = self
+            .sent
+            .checked_add(bytes as u64)
+            .ok_or_else(|| RuntimeError::Custom("startup stdin counter overflow".into()))?;
+        Ok(())
+    }
+
+    fn acknowledge(&mut self, consumed: u64) -> RuntimeResult<()> {
+        if consumed < self.consumed || consumed > self.sent {
+            return Err(RuntimeError::Custom(
+                "invalid startup stdin acknowledgement".into(),
+            ));
+        }
+        self.consumed = consumed;
+        Ok(())
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -178,11 +219,53 @@ async fn run_startup_command_inner(
         rlimits: Vec::new(),
     };
 
-    let mut stream = client
-        .stream(TypedMessage::new(MessageType::ExecRequest, &request))
-        .await
-        .map_err(|err| RuntimeError::Custom(format!("startup command dispatch: {err}")))?;
+    let isolated = command.isolation.map(|isolation| IsolatedExecRequest {
+        process: request.clone(),
+        isolation,
+    });
+    let stream = match &isolated {
+        Some(request) => {
+            client
+                .stream(TypedMessage::new(MessageType::ExecIsolated, request))
+                .await
+        }
+        None => {
+            client
+                .stream(TypedMessage::new(MessageType::ExecRequest, &request))
+                .await
+        }
+    };
+    let stream =
+        stream.map_err(|err| RuntimeError::Custom(format!("startup command dispatch: {err}")))?;
     let id = stream.id();
+    let policy = client
+        .ready()
+        .agent
+        .exec_limits
+        .filter(|_| client.ready().supports(MessageType::ExecOutputAck));
+    if let Some(policy) = policy {
+        policy
+            .validate()
+            .map_err(|error| RuntimeError::Custom(error.into()))?;
+    }
+    let mut input_window = StartupInputWindow {
+        policy,
+        sent: 0,
+        consumed: 0,
+    };
+    let (sender, mut stream) = stream.into_parts();
+    let acknowledgements = OutputAcknowledgements::default();
+    let consumed_output = acknowledgements.consumed.clone();
+    let mut output_ack = ExecOutputAck::default();
+    let worker = tokio::spawn(acknowledgements.run(move |ack| {
+        let sender = sender.clone();
+        async move {
+            sender
+                .send(TypedMessage::new(MessageType::ExecOutputAck, &ack))
+                .await
+        }
+    }));
+    let mut worker = tokio_util::task::AbortOnDropHandle::new(worker);
     let mut initial_stdin = initial_startup_stdin(uses_console || stdin.is_some());
     let mut resize_poll = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut signal_poll = tokio::time::interval(std::time::Duration::from_millis(20));
@@ -190,12 +273,17 @@ async fn run_startup_command_inner(
     let mut stdin_buf = [0u8; 4096];
 
     loop {
+        let input_capacity = input_window.capacity(input.len());
         tokio::select! {
-            read = read_startup_input(&mut stdin, &mut stdin_buf), if started && stdin.is_some() => {
+            result = &mut worker => {
+                return Err(RuntimeError::Custom(format!("startup output acknowledgement: {result:?}")));
+            }
+            read = read_startup_input(&mut stdin, &mut stdin_buf[..input_capacity]), if started && stdin.is_some() && input_capacity > 0 => {
                 let n = read.map_err(|error| RuntimeError::Custom(format!("startup stdin: {error}")))?;
                 let result = client.send(id, TypedMessage::new(MessageType::ExecStdin,
                     &ExecStdin { data: stdin_buf[..n].to_vec() })).await;
                 check_initial_stdin_delivery(result)?;
+                input_window.sent(n)?;
                 if n == 0 { stdin = None; }
             }
             _ = signal_poll.tick(), if signal_path.is_some() => {
@@ -220,8 +308,8 @@ async fn run_startup_command_inner(
                         .await;
                 }
             }
-            read = read_optional_startup_console_input(console.as_ref(), &mut input),
-                if started && console.is_some() && !console_input_closed =>
+            read = read_optional_startup_console_input(console.as_ref(), &mut input[..input_capacity]),
+                if started && console.is_some() && !console_input_closed && input_capacity > 0 =>
             {
                 match read {
                     Ok(0) => {
@@ -239,6 +327,8 @@ async fn run_startup_command_inner(
                             .is_err()
                         {
                             console_input_closed = true;
+                        } else {
+                            input_window.sent(n)?;
                         }
                     }
                     Err(error) if is_console_disconnect(&error) => {
@@ -291,6 +381,10 @@ async fn run_startup_command_inner(
                             &stdout.data,
                         )
                         .await?;
+                        if policy.is_some() {
+                            output_ack.consume(stdout.data.len()).ok_or_else(|| RuntimeError::Custom("startup output counter overflow".into()))?;
+                            consumed_output.send_replace(output_ack.clone());
+                        }
                     }
                     Some(MessageType::ExecStderr) => {
                         let stderr = message.payload::<ExecStderr>().map_err(|err| {
@@ -303,6 +397,18 @@ async fn run_startup_command_inner(
                             &stderr.data,
                         )
                         .await?;
+                        if policy.is_some() {
+                            output_ack.consume(stderr.data.len()).ok_or_else(|| RuntimeError::Custom("startup output counter overflow".into()))?;
+                            consumed_output.send_replace(output_ack.clone());
+                        }
+                    }
+                    Some(MessageType::ExecStdinAck) => {
+                        let ack = message.payload::<ExecStdinAck>().map_err(|err| RuntimeError::Custom(format!("startup stdin acknowledgement: {err}")))?;
+                        input_window.acknowledge(ack.consumed)?;
+                    }
+                    Some(MessageType::ExecStdinError) => {
+                        stdin = None;
+                        console_input_closed = true;
                     }
                     Some(MessageType::ExecExited) => {
                         let exited = message.payload::<ExecExited>().map_err(|err| {
@@ -341,9 +447,10 @@ fn startup_input(file: std::fs::File) -> RuntimeResult<StartupInput> {
     {
         use std::os::unix::fs::FileTypeExt;
         if file.metadata()?.file_type().is_fifo() {
-            return Ok(StartupInput::Pipe(StartupConsoleBridge {
-                fd: AsyncFd::new(file.into())?,
-            }));
+            // SAFETY: the owned descriptor stays open and unchanged until AsyncFd is dropped.
+            let fd =
+                unsafe { AsyncFd::register(OwnedFd::from(file)) }.map_err(std::io::Error::from)?;
+            return Ok(StartupInput::Pipe(StartupConsoleBridge { fd }));
         }
     }
     Ok(StartupInput::File(tokio::fs::File::from_std(file)))
@@ -370,7 +477,8 @@ fn open_startup_console(
         return Ok(None);
     };
     set_nonblocking(fd.as_raw_fd())?;
-    let fd = AsyncFd::new(fd)?;
+    // SAFETY: AsyncFd owns this descriptor; no raw close or replacement is performed.
+    let fd = unsafe { AsyncFd::register(fd) }.map_err(std::io::Error::from)?;
     Ok(Some(StartupConsoleBridge { fd }))
 }
 
@@ -654,9 +762,161 @@ fn take_signal_request(path: &Path) -> RuntimeResult<Option<i32>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::io::{Seek, Write};
     use std::path::Path;
 
     use microsandbox_agent_client::{ClientError, ErrorKind};
+    #[cfg(unix)]
+    use microsandbox_protocol::{
+        codec,
+        core::Ready,
+        exec::{ExecExited, ExecOutputAck, ExecStarted, ExecStdin, ExecStdinAck, ExecStdout},
+        message::{Message, MessageType},
+    };
+    #[cfg(unix)]
+    use tokio::io::AsyncWriteExt;
+    #[cfg(unix)]
+    use tokio::net::UnixListener;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_forwards_multiple_input_windows_and_acknowledges_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let policy = super::ExecLimits::default();
+        let bytes = vec![b'x'; policy.input_limit as usize * 3];
+        let expected = bytes.len();
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(&bytes).unwrap();
+        input.rewind().unwrap();
+        let output = tempfile::tempfile().unwrap();
+        let stdio = super::StartupStdio {
+            stdin: Some(input),
+            stdout: output.try_clone().unwrap(),
+            stderr: output,
+        };
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(&1u32.to_be_bytes()).await.unwrap();
+            socket.write_all(&100u32.to_be_bytes()).await.unwrap();
+            let ready = Message::with_payload(
+                MessageType::Ready,
+                0,
+                &Ready {
+                    exec_limits: Some(policy),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            codec::write_message(&mut socket, &ready).await.unwrap();
+            let request = codec::read_message(&mut socket).await.unwrap();
+            assert_eq!(request.t, MessageType::ExecIsolated);
+            let id = request.id;
+            let started =
+                Message::with_payload(MessageType::ExecStarted, id, &ExecStarted { pid: 1 })
+                    .unwrap();
+            codec::write_message(&mut socket, &started).await.unwrap();
+            let mut received = 0u64;
+            loop {
+                let message = codec::read_message(&mut socket).await.unwrap();
+                assert_eq!(message.t, MessageType::ExecStdin);
+                let data = message.payload::<ExecStdin>().unwrap().data;
+                if data.is_empty() {
+                    break;
+                }
+                assert!(data.len() <= policy.stdin_chunk_size as usize);
+                assert!(data.iter().all(|byte| *byte == b'x'));
+                received += data.len() as u64;
+                if received.is_multiple_of(u64::from(policy.input_limit)) {
+                    let ack = Message::with_payload(
+                        MessageType::ExecStdinAck,
+                        id,
+                        &ExecStdinAck { consumed: received },
+                    )
+                    .unwrap();
+                    codec::write_message(&mut socket, &ack).await.unwrap();
+                }
+            }
+            assert_eq!(received, expected as u64);
+            let mut consumed = ExecOutputAck::default();
+            // Send more than one output window, requiring consumption acknowledgements.
+            for _ in 0..80 {
+                let data = vec![b'y'; policy.output_chunk_size as usize];
+                consumed.consume(data.len()).unwrap();
+                let stdout =
+                    Message::with_payload(MessageType::ExecStdout, id, &ExecStdout { data })
+                        .unwrap();
+                codec::write_message(&mut socket, &stdout).await.unwrap();
+                let ack = codec::read_message(&mut socket).await.unwrap();
+                assert_eq!(ack.t, MessageType::ExecOutputAck);
+                assert_eq!(
+                    ack.payload::<ExecOutputAck>().unwrap().consumed,
+                    consumed.consumed
+                );
+            }
+            let exited =
+                Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 42 })
+                    .unwrap();
+            codec::write_message(&mut socket, &exited).await.unwrap();
+        });
+        let command = serde_json::from_value(serde_json::json!({
+            "cmd": "cat", "args": [], "env": [], "cwd": null, "user": null, "isolation": {}
+        }))
+        .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::run_startup_command(
+                &path,
+                command,
+                Some(stdio),
+                None,
+                #[cfg(feature = "net")]
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(result, super::StartupCommandExit::Exited(42)));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn startup_input_waits_for_acknowledgements_and_respects_chunk_size() {
+        let mut window = super::StartupInputWindow {
+            policy: Some(super::ExecLimits {
+                input_limit: 8,
+                stdin_chunk_size: 4,
+                ..Default::default()
+            }),
+            sent: 0,
+            consumed: 0,
+        };
+        assert_eq!(window.capacity(4096), 4);
+        window.sent(8).unwrap();
+        assert_eq!(window.capacity(4096), 0);
+        window.acknowledge(3).unwrap();
+        assert_eq!(window.capacity(4096), 3);
+        window.acknowledge(3).unwrap();
+        assert_eq!(window.capacity(4096), 3);
+        assert!(window.acknowledge(2).is_err());
+        assert!(window.acknowledge(9).is_err());
+        window.acknowledge(8).unwrap();
+        assert_eq!(window.capacity(4096), 4);
+    }
+
+    #[test]
+    fn startup_input_without_policy_retains_legacy_capacity() {
+        let mut window = super::StartupInputWindow {
+            policy: None,
+            sent: 0,
+            consumed: 0,
+        };
+        window.sent(65536).unwrap();
+        assert_eq!(window.capacity(4096), 4096);
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

@@ -11,12 +11,12 @@ pub(crate) fn oci_features_json() -> serde_json::Value {
         "hooks": [],
         "mountOptions": [],
         "linux": {
-            "namespaces": [],
+            "namespaces": ["pid", "mount", "ipc", "uts", "cgroup", "network"],
             "capabilities": microsandbox_protocol::exec::EXEC_CAPABILITY_NAMES,
             "cgroup": {
                 "v1": false,
-                "v2": false,
-                "systemd": false,
+                "v2": true,
+                "systemd": true,
                 "systemdUser": false,
                 "rdma": false
             },
@@ -54,6 +54,15 @@ mod tests {
         assert!(features["hooks"].is_array());
         assert!(features["mountOptions"].as_array().unwrap().is_empty());
         assert_eq!(features["linux"]["seccomp"]["enabled"], false);
+        assert_eq!(features["linux"]["cgroup"]["v1"], false);
+        assert_eq!(features["linux"]["cgroup"]["v2"], true);
+        assert!(
+            !features["linux"]["namespaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == "user" || item == "time")
+        );
         assert!(
             features["linux"]["capabilities"]
                 .as_array()

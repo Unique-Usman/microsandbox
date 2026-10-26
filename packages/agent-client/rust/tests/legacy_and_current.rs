@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn version_compat_across_generations() {
-        use MessageType::{ExecRequest, FsRequest};
+        use MessageType::{ExecIsolated, ExecOutputAck, ExecRequest, ExecStdinAck, FsRequest};
         // (message type, peer generation, expected allowed). Generation 1 is the
         // pre-0.5 legacy runtime (no filesystem); generation 2 introduced the
         // Fs* types; generation 6 is current.
@@ -243,6 +243,10 @@ mod tests {
             (FsRequest, 1, false),
             (FsRequest, 2, true),
             (FsRequest, 3, true),
+            (ExecOutputAck, 10, true),
+            (ExecStdinAck, 10, true),
+            (ExecIsolated, 10, false),
+            (ExecIsolated, 11, true),
         ];
         for (t, generation, allowed) in cases {
             assert_eq!(

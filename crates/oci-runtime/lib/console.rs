@@ -94,7 +94,8 @@ pub(crate) fn open_console_bridge(path: &Path) -> Result<ConsoleBridge> {
         .with_context(|| format!("open OCI console slave `{}`", path.display()))?;
     let fd: OwnedFd = file.into();
     set_nonblocking(fd.as_raw_fd()).context("set OCI console slave nonblocking")?;
-    let fd = AsyncFd::new(fd).context("register OCI console slave with tokio")?;
+    // SAFETY: AsyncFd owns the descriptor and it is never closed or replaced externally.
+    let fd = unsafe { AsyncFd::register(fd) }.context("register OCI console slave with tokio")?;
     Ok(ConsoleBridge { fd })
 }
 

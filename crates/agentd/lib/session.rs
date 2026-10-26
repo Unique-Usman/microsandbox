@@ -28,6 +28,7 @@ use crate::process::{ProcessExitWatcher, ProcessIdentity, ProcessManager};
 use crate::rlimit;
 use crate::serial::InputCharge;
 use crate::workload::WorkloadPlacement;
+use crate::workload_namespace::{NamespaceChild, NamespaceParent};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -1081,6 +1082,8 @@ impl ExecSession {
         let parsed_rlimits = rlimit::to_libc(&req.rlimits);
         let security = PreparedSecurity::new(req.security.as_ref(), security_profile)?;
 
+        let (namespace_parent, namespace_child) = prepare_namespaces(workload_placement.as_ref())?;
+
         // Prevent the central reaper from observing this child before its PID
         // and generation are registered.
         let spawn_guard = process_manager.spawn_guard()?;
@@ -1100,9 +1103,19 @@ impl ExecSession {
             drop(pty.master);
             drop(err_pipe.read_end);
 
+            if let Some(namespace) = &namespace_child
+                && let Err(error) = namespace.enter(workload_placement.as_ref().unwrap())
+            {
+                write_exec_errno_and_exit(
+                    err_pipe.write_end.as_raw_fd(),
+                    error.raw_os_error().unwrap_or(libc::EIO),
+                );
+            }
+
             // Join the workload cgroup before any user code can execute. This
             // closes the post-spawn PID-assignment race with checkpoint freeze.
-            if let Some(ref placement) = workload_placement
+            if namespace_child.is_none()
+                && let Some(ref placement) = workload_placement
                 && placement.place_current().is_err()
             {
                 write_exec_error_and_exit(err_pipe.write_end.as_raw_fd());
@@ -1203,6 +1216,23 @@ impl ExecSession {
         // Parent process.
         drop(pty.slave);
         drop(err_pipe.write_end);
+        drop(namespace_child);
+        let pid = match namespace_parent {
+            Some(parent) => match parent.finish(Some(pid), true) {
+                Ok(pid) => pid,
+                Err(error) => {
+                    let error = read_exec_error(err_pipe.read_end.as_raw_fd())?
+                        .map(std::io::Error::from_raw_os_error)
+                        .unwrap_or(error);
+                    return Err(AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
+                        &error,
+                        &req.cmd,
+                        "namespace setup",
+                    )));
+                }
+            },
+            None => pid,
+        };
         let exit_watcher = spawn_guard.track(pid)?;
         let process_identity = exit_watcher.identity();
 
@@ -1292,10 +1322,6 @@ impl ExecSession {
             }
         }
 
-        if let Some(ref dir) = req.cwd {
-            cmd.current_dir(dir);
-        }
-
         let resolved_user = resolve_requested_user(req, default_user)?;
         if let Some(home) = default_home_dir(req, resolved_user.as_ref())? {
             cmd.env("HOME", home.to_string_lossy().into_owned());
@@ -1304,11 +1330,34 @@ impl ExecSession {
         // Apply the security profile and resource limits in the child before exec.
         let parsed_rlimits = rlimit::to_libc(&req.rlimits);
         let security = PreparedSecurity::new(req.security.as_ref(), security_profile)?;
+        let (namespace_parent, namespace_child) = prepare_namespaces(workload_placement.as_ref())?;
+        // An exec working directory may exist only in the workload's mount namespace.
+        if namespace_child.is_none()
+            && let Some(ref dir) = req.cwd
+        {
+            cmd.current_dir(dir);
+        }
+        let namespace_cwd = req
+            .cwd
+            .as_deref()
+            .map(CString::new)
+            .transpose()
+            .map_err(|error| AgentdError::ExecSession(format!("invalid cwd: {error}")))?;
         unsafe {
             cmd.pre_exec(move || {
+                if let Some(namespace) = &namespace_child {
+                    namespace.enter(workload_placement.as_ref().unwrap())?;
+                    if let Some(cwd) = &namespace_cwd
+                        && libc::chdir(cwd.as_ptr()) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 // This uses only write(2) in the child and therefore remains
                 // safe in the fork-to-exec window.
-                if let Some(ref placement) = workload_placement {
+                if namespace_child.is_none()
+                    && let Some(ref placement) = workload_placement
+                {
                     placement.place_current()?;
                 }
                 // Become a session (and process-group) leader so signals sent
@@ -1346,7 +1395,7 @@ impl ExecSession {
             stdout,
             stderr,
             exit_watcher,
-        } = spawn_piped_process(cmd, process_manager)?;
+        } = spawn_piped_process_isolated(cmd, process_manager, namespace_parent)?;
         let process_identity = exit_watcher.identity();
         let stdin = stdin
             .map(|input| input.into_owned_fd().and_then(nonblocking_input))
@@ -1408,23 +1457,51 @@ impl Drop for ExecSession {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(test)]
 fn spawn_piped_process(
+    command: Command,
+    process_manager: &ProcessManager,
+) -> AgentdResult<PipedProcess> {
+    spawn_piped_process_isolated(command, process_manager, None)
+}
+
+fn prepare_namespaces(
+    placement: Option<&WorkloadPlacement>,
+) -> std::io::Result<(Option<NamespaceParent>, Option<NamespaceChild>)> {
+    match placement.and_then(|placement| placement.isolation.as_ref()) {
+        Some(domain) => domain
+            .prepare()
+            .map(|(parent, child)| (Some(parent), Some(child))),
+        None => Ok((None, None)),
+    }
+}
+
+fn spawn_piped_process_isolated(
     mut command: Command,
     process_manager: &ProcessManager,
+    namespace_parent: Option<NamespaceParent>,
 ) -> AgentdResult<PipedProcess> {
     let cmd_label = command.get_program().to_string_lossy().into_owned();
 
     // Prevent the central reaper from observing this child before its PID and
     // generation are registered.
     let spawn_guard = process_manager.spawn_guard()?;
-    let mut child = command.spawn().map_err(|error| {
+    let result = command.spawn();
+    drop(command);
+    let actual_pid = namespace_parent.map(|parent| {
+        parent.finish(
+            result.as_ref().ok().map(|child| child.id() as i32),
+            result.is_ok(),
+        )
+    });
+    let mut child = result.map_err(|error| {
         AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
             &error,
             &cmd_label,
             "Command::spawn",
         ))
     })?;
-    let pid = child.id() as i32;
+    let pid = actual_pid.transpose()?.unwrap_or(child.id() as i32);
     let exit_watcher = spawn_guard.track(pid)?;
     let process_identity = exit_watcher.identity();
 
@@ -2099,7 +2176,9 @@ async fn pipe_reader_task(
 mod tests {
     use microsandbox_protocol::exec::EXEC_OUTPUT_EVENT_OVERHEAD;
     use std::collections::HashMap;
+    use std::fs;
     use std::io::Read;
+    use std::path::Path;
     use std::process::{Command as StdCommand, Stdio as StdStdio};
     use std::time::Duration;
 
@@ -2534,6 +2613,295 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn isolated_pipe_and_pty_preserve_exit_and_output() {
+        for tty in [false, true] {
+            let domain =
+                crate::workload_namespace::NamespaceDomain::new(Default::default()).unwrap();
+            let req = ExecRequest {
+                cmd: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo ISOLATED_OK; exit 42".into()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                tty,
+                rows: 24,
+                cols: 80,
+                rlimits: Vec::new(),
+                security: None,
+            };
+            let (tx, mut rx) = SessionOutputSender::channel();
+            let session = ExecSession::spawn(
+                1,
+                &req,
+                tx,
+                None,
+                SecurityProfile::Default,
+                Some(WorkloadPlacement::for_namespace_test(domain)),
+                None,
+            )
+            .unwrap();
+            assert!(session.pid() > 0);
+            let mut output = Vec::new();
+            let code = time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match rx.recv().await.unwrap().output {
+                        SessionOutput::Stdout(bytes) => output.extend_from_slice(&bytes),
+                        SessionOutput::Exited(code) => break code,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(code, 42);
+            assert!(String::from_utf8_lossy(&output).contains("ISOLATED_OK"));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "run inside unshare -Urmpf --mount-proc for private guest-like namespaces"]
+    async fn isolated_init_and_exec_share_namespaces() {
+        for tty in [false, true] {
+            let domain = crate::workload_namespace::NamespaceDomain::new(
+                microsandbox_protocol::isolation::WorkloadIsolation {
+                    pid: true,
+                    mount: true,
+                    ipc: true,
+                    uts: true,
+                    cgroup: true,
+                    hostname: Some("isolated-test".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let req = ExecRequest {
+                cmd: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo INIT_PID=$$; read line; exit 23".into()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                tty,
+                rows: 24,
+                cols: 80,
+                rlimits: Vec::new(),
+                security: None,
+            };
+            let (tx, mut rx) = SessionOutputSender::channel();
+            let init = ExecSession::spawn(
+                1,
+                &req,
+                tx,
+                None,
+                SecurityProfile::Default,
+                Some(WorkloadPlacement::for_namespace_test(Arc::clone(&domain))),
+                None,
+            )
+            .unwrap();
+            for kind in ["pid", "mnt", "ipc", "uts", "cgroup"] {
+                let workload = fs::read_link(format!("/proc/{}/ns/{kind}", init.pid())).unwrap();
+                let agent = fs::read_link(format!("/proc/self/ns/{kind}")).unwrap();
+                assert_ne!(workload, agent, "agent must stay outside {kind} namespace");
+            }
+            let initial = time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let SessionOutput::Stdout(bytes) = initial.output else {
+                panic!("missing init output");
+            };
+            assert!(String::from_utf8_lossy(&bytes).contains("INIT_PID=1"));
+            let mut req = req.clone();
+            req.cwd = Some("/tmp".into());
+            req.args = vec!["-exc".into(), "test \"$PWD\" = /tmp; test \"$(cat /proc/sys/kernel/hostname)\" = isolated-test; for kind in pid mnt ipc uts cgroup; do test \"$(readlink /proc/self/ns/$kind)\" = \"$(readlink /proc/1/ns/$kind)\"; done; test \"$(cat /proc/1/comm)\" = sh; test \"$(cat /proc/self/cgroup)\" = '0::/'; test ! -w /sys/fs/cgroup/cgroup.procs; exit 37".into()];
+            let (tx, mut exec_rx) = SessionOutputSender::channel();
+            let _exec = ExecSession::spawn(
+                2,
+                &req,
+                tx,
+                None,
+                SecurityProfile::Default,
+                Some(WorkloadPlacement::for_namespace_test(Arc::clone(&domain))),
+                None,
+            )
+            .unwrap();
+            let mut exec_output = Vec::new();
+            let code = time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match exec_rx.recv().await.unwrap().output {
+                        SessionOutput::Exited(code) => break code,
+                        SessionOutput::Stdout(bytes) | SessionOutput::Stderr(bytes) => {
+                            exec_output.extend_from_slice(&bytes)
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(code, 37, "{}", String::from_utf8_lossy(&exec_output));
+            init.write_stdin(b"done\n").await.unwrap();
+            let code = time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let SessionOutput::Exited(code) = rx.recv().await.unwrap().output {
+                        break code;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(code, 23);
+            let (tx, _) = SessionOutputSender::channel();
+            assert!(
+                ExecSession::spawn(
+                    3,
+                    &req,
+                    tx,
+                    None,
+                    SecurityProfile::Default,
+                    Some(WorkloadPlacement::for_namespace_test(domain)),
+                    None,
+                )
+                .is_err(),
+                "cannot enter dead init's PID namespace"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires unshare -Urm inside a private delegated systemd scope and MSB_TEST_DELEGATED_CGROUP=1"]
+    async fn isolated_exec_cannot_bypass_task_limit() {
+        assert_eq!(
+            std::env::var("MSB_TEST_DELEGATED_CGROUP").as_deref(),
+            Ok("1")
+        );
+        let memberships = fs::read_to_string("/proc/self/cgroup").unwrap();
+        let relative = memberships
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap();
+        assert!(relative.ends_with(".scope"));
+        let parent = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+        assert_eq!(
+            fs::read_to_string(parent.join("cgroup.procs"))
+                .unwrap()
+                .trim(),
+            std::process::id().to_string()
+        );
+        fs::create_dir(parent.join("manager")).unwrap();
+        fs::write(parent.join("manager/cgroup.procs"), "0").unwrap();
+        let workload = parent.join("workload");
+        fs::create_dir(&workload).unwrap();
+        crate::workload_resources::configure(
+            &workload,
+            &microsandbox_protocol::isolation::WorkloadResources {
+                pids_max: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        for tty in [false, true] {
+            let domain = crate::workload_namespace::NamespaceDomain::new(
+                microsandbox_protocol::isolation::WorkloadIsolation {
+                    mount: true,
+                    cgroup: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let placement = || {
+                let mut placement = WorkloadPlacement::for_namespace_test(Arc::clone(&domain));
+                placement.cgroup_directory = Some(fs::File::open(&workload).unwrap().into());
+                placement
+            };
+            let req = ExecRequest {
+                cmd: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo READY; read line".into()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                tty,
+                rows: 24,
+                cols: 80,
+                rlimits: Vec::new(),
+                security: None,
+            };
+            let (tx, mut rx) = SessionOutputSender::channel();
+            let init = ExecSession::spawn(
+                1,
+                &req,
+                tx,
+                None,
+                SecurityProfile::Default,
+                Some(placement()),
+                None,
+            )
+            .unwrap();
+            time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(workload.join("pids.current"))
+                    .unwrap()
+                    .trim(),
+                "1"
+            );
+            let mut exec_req = req.clone();
+            exec_req.args = vec!["-c".into(), "exit 37".into()];
+            let (tx, mut exec_rx) = SessionOutputSender::channel();
+            let _exec = ExecSession::spawn(
+                2,
+                &exec_req,
+                tx,
+                None,
+                SecurityProfile::Default,
+                Some(placement()),
+                None,
+            )
+            .expect("exec must enter the cgroup before joining its nsdelegate namespace");
+            time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let SessionOutput::Exited(code) = exec_rx.recv().await.unwrap().output {
+                        assert_eq!(code, 37);
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            fs::write(workload.join("pids.max"), "1").unwrap();
+            let (tx, _) = SessionOutputSender::channel();
+            let result = ExecSession::spawn(
+                2,
+                &req,
+                tx,
+                None,
+                SecurityProfile::Default,
+                Some(placement()),
+                None,
+            );
+            let Err(AgentdError::ExecSpawnFailed(error)) = result else {
+                panic!("exec bypassed pids.max or lost its typed failure");
+            };
+            assert_eq!(error.errno, Some(libc::EAGAIN));
+            init.write_stdin(b"done\n").await.unwrap();
+            time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let SessionOutput::Exited(code) = rx.recv().await.unwrap().output {
+                        assert_eq!(code, 0);
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            fs::write(workload.join("pids.max"), "2").unwrap();
+        }
+        fs::remove_dir(workload).unwrap();
+    }
+
     async fn run_single_pipe_spawn(id: u32, code: i32) {
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
@@ -2926,7 +3294,7 @@ mod tests {
             rlimits: Vec::new(),
             security: Some(security),
         };
-        let session = ExecSession::spawn(80, &req, tx, None, SecurityProfile::Default, None)
+        let session = ExecSession::spawn(80, &req, tx, None, SecurityProfile::Default, None, None)
             .expect("security session must start");
         let mut output = Vec::new();
         let result = time::timeout(Duration::from_secs(5), async {
@@ -3026,7 +3394,8 @@ mod tests {
                     ..Default::default()
                 }),
             };
-            let result = ExecSession::spawn(81, &req, tx, None, SecurityProfile::Default, None);
+            let result =
+                ExecSession::spawn(81, &req, tx, None, SecurityProfile::Default, None, None);
             assert!(matches!(result, Err(error) if error.to_string().contains("CAP_UNKNOWN")));
         }
     }
@@ -3092,7 +3461,8 @@ mod tests {
                     ..Default::default()
                 }),
             };
-            let result = ExecSession::spawn(82, &req, tx, None, SecurityProfile::Default, None);
+            let result =
+                ExecSession::spawn(82, &req, tx, None, SecurityProfile::Default, None, None);
             assert!(
                 matches!(result, Err(AgentdError::ExecSpawnFailed(error)) if error.errno == Some(libc::EPERM))
             );

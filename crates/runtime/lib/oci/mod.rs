@@ -1,12 +1,13 @@
 //! OCI Runtime Specification compatibility primitives.
 //!
-//! This module contains the host-side contracts that a future
-//! `runmsb` OCI binary and a containerd shim can share. It does
-//! not launch VMs directly; instead it defines the durable state model,
-//! bundle parsing, and lifecycle validation used to map OCI commands onto
-//! Microsandbox's existing microVM runtime.
+//! Shared durable state, bundle parsing and lifecycle validation for `runmsb`.
+//! The Linux `oci-runtime` feature also supplies host cgroup placement used by
+//! the VMM before allocating guest memory. Ordinary OCI data types remain
+//! available without enabling the VM runner.
 
 mod bundle;
+#[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+pub mod cgroup;
 mod error;
 mod lifecycle;
 mod state;

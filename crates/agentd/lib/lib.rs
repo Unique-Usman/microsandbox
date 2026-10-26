@@ -15,6 +15,8 @@ mod readonly_root;
 mod rlimit;
 mod root_disk;
 mod workload;
+mod workload_namespace;
+mod workload_resources;
 
 //--------------------------------------------------------------------------------------------------
 // Exports

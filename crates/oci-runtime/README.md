@@ -4,14 +4,14 @@
 
 ### Compatibility and limitations
 
-`runmsb` accepts Docker/containerd OCI configuration without a blanket rejection
-of cgroups, resources, namespaces, security settings, hooks, or mounts. These
-fields remain implementation work where their semantics are not yet supported.
-The existing bundle validation still rejects malformed configurations, and
-unsupported commands and CLI operations return explicit errors.
+`runmsb` implements the namespace and resource subset described below. Explicit
+unsupported resource controls and guest namespace requests are rejected. Other
+accepted compatibility fields, such as device rules and hooks, do not imply
+enforcement. Bundle validation rejects malformed configurations, and unsupported
+commands and CLI operations return explicit errors.
 
 Acceptance does not mean enforcement. Do not rely on seccomp,
-AppArmor/SELinux, cgroup limits, or full namespace isolation in
+AppArmor/SELinux, device cgroup rules, or full OCI namespace semantics in
 this experimental runtime. VM isolation does not replace those requested
 controls. Full Docker bridge networking and complete mount
 flags/ownership semantics also remain incomplete.
@@ -38,9 +38,95 @@ transition rules still apply when executing setuid or file-capability binaries.
 These additions target matching current `runmsb`, `msb`, and embedded agentd
 builds. Rebuild the guest agent, embed it into `msb`, install both host binaries,
 and recreate containers. There is no compatibility implementation for these
-new settings on older builds; an old agent can ignore the added request fields.
-Do not use mixed builds to rely on these protections. Existing compatibility
+new settings on older builds. OCI workload setup now requires the advertised
+`oci_isolation` launch capability and agent generation 11; an unsupported peer
+fails instead of starting an unisolated workload. Existing compatibility
 code for unrelated SDK/runtime operations is unchanged.
+
+### Workload namespaces and limits
+
+One microVM still represents one container. Agentd remains PID 1 of the guest
+kernel. When OCI requests a PID namespace, the container command becomes PID 1
+inside that namespace. Every later exec joins the same pinned namespace set.
+The short-lived launch helper is reaped immediately; there is no persistent
+monitor or second container runtime inside the VM.
+
+PID, mount, IPC, UTS and cgroup namespaces are supported in the guest. The rootfs
+and configured mounts are prepared once. The workload receives private proc,
+mqueue and read-only cgroup views where requested. `--hostname` configures the
+workload's UTS namespace. Agentd keeps its own management namespaces. User/time
+namespaces, UID/GID mappings and joining host namespace paths from the guest are
+not implemented and fail explicitly. Host network namespace handling remains
+separate and unchanged; this does not add Docker port forwarding or network DNS.
+
+The guest workload cgroup applies CPU quota/period, CPU shares translated to v2
+weight, memory, memory-plus-swap and task limits. Init, exec and descendants
+share the limits. Agentd stays outside this cgroup. `clone3(CLONE_INTO_CGROUP)`
+places new workloads atomically, so exec cannot bypass a full `pids.max` limit.
+The guest enables `nsdelegate`, protecting the namespace root's resource limits
+even if a privileged workload remounts its cgroup view writable.
+The guest kernel must support these calls and the requested v2 controllers.
+Missing support aborts workload startup; there is no unrestricted fallback.
+
+The host VMM also gets its own cgroup, using `linux.cgroupsPath`, before it
+allocates guest RAM. Moving it after boot would leave existing memory charges
+in the launcher's cgroup. Systemd paths
+use a transient scope and require systemd's `PIDFDs` support. Filesystem paths
+require a writable/delegated cgroup-v2 hierarchy. No cgroup-v1 fallback exists.
+The VMM's host PID remains the PID reported to the stock containerd shim.
+
+Requested limits are ceilings, not reservations or guaranteed performance:
+
+| Resource | Guest workload | VM/host management allowance |
+| --- | --- | --- |
+| Memory | Full requested bytes in `memory.max` | VM RAM rounds up to MiB and adds 128 MiB; host `memory.max` adds another 128 MiB |
+| CPU | Full requested quota and period | VM gets `ceil(quota / period) + 1` vCPUs; host quota adds 10% of one CPU |
+| Tasks | Full requested `pids.max`, including exec | Guest agent and host VMM threads are excluded; guest task limits are not copied onto host threads |
+
+These management allowances are provisional budgets, not measured worst-case
+guarantees. For example, a 512 MiB workload receives a 512 MiB guest ceiling,
+640 MiB VM RAM and a 768 MiB host ceiling. Heavy I/O or unusual workloads can
+still exhaust a management budget. Swap limits do not provision guest swap.
+Firmware built without swap has no `memory.swap.max` file: zero swap capacity
+already satisfies the requested ceiling. A swap-capable kernel missing the
+requested controller is rejected.
+CPU sets, realtime/burst/idle controls, memory reservation/swappiness/OOM-disable,
+I/O, hugepages, RDMA, arbitrary unified controls and live `update` are unsupported.
+Device allow/deny rules remain accepted but unenforced compatibility fields.
+
+PID 1 has Linux init signal semantics: applications should handle termination
+and reap children. Killing workload PID 1 tears down its PID namespace; exec
+must not create a replacement namespace after that exit.
+
+After rebuilding and installing the matched binaries, check the guest view:
+
+```bash
+docker run --rm --runtime runmsb --hostname ns-check alpine sh -ec \
+  'test "$$" = 1; test "$(hostname)" = ns-check; cat /proc/self/cgroup'
+```
+
+Expect `0::/`. Check the applied resource files separately:
+
+```bash
+docker run --rm --runtime runmsb --cpus 0.5 --memory 64m \
+  --memory-swap 64m --pids-limit 8 alpine sh -ec \
+  'cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max /sys/fs/cgroup/pids.max; if test -f /sys/fs/cgroup/memory.swap.max; then cat /sys/fs/cgroup/memory.swap.max; else grep SwapTotal /proc/meminfo; fi'
+```
+
+Expect `50000 100000`, `67108864`, `8`, and either `0` or `SwapTotal: 0 kB`.
+Exec must count against the
+same task limit, not create a separate allowance:
+
+```bash
+docker run -d --name msb-pids-check --runtime runmsb --pids-limit 1 alpine sleep 300
+docker exec msb-pids-check true
+docker kill --signal KILL msb-pids-check
+docker wait msb-pids-check
+docker rm msb-pids-check
+```
+
+The exec command should fail with a resource-unavailable error; the init should
+remain running until explicitly killed. Wait should report 137 after SIGKILL.
 
 After installing matching builds, check both init and exec:
 
@@ -119,7 +205,8 @@ docker run --rm --runtime runmsb --read-only --tmpfs /scratch alpine sh -ec \
 
 Compatibility-only CLI switches remain accepted: `--systemd-cgroup`,
 `--cgroup-manager`, `--rootless`, `--no-pivot`, and `--no-new-keyring`. They do not
-claim implementation of cgroups, rootless execution, or host namespace controls.
+select the cgroup driver: the OCI `linux.cgroupsPath` shape selects it. They do
+not implement rootless execution or otherwise override namespace policy.
 Zero `--preserve-fds` remains accepted; nonzero counts and `--pidfd-socket` request
 unimplemented descriptor handling and are rejected. Exec overrides not applied
 by the implementation are rejected, even alongside `--process`.
@@ -136,7 +223,7 @@ Microsandbox's existing libkrun microVM and `agentd` process APIs to the OCI lif
 Docker and containerd.
 
 The patch demonstrates that basic Docker workloads can run through Microsandbox, but it is not yet
-a complete OCI implementation. In particular, hooks, cgroups, security policies, and
+a complete OCI implementation. In particular, hooks, several resource/security controls, and
 complete Docker networking are still missing. This report describes the implementation, its current
 limits, and the decisions that need maintainer agreement before the runtime becomes supported.
 
@@ -406,18 +493,14 @@ implements the runc-style command surface it expects.
 ## Current gaps
 
 - OCI hooks are not executed.
-- Cgroups and resource updates are not implemented. In particular, Docker's
-  `--pids-limit` is accepted but not enforced: a test with a limit of 16 still
-  started 24 child processes. A guest workload cgroup needs to count and limit
-  guest processes; limiting host VMM threads is not equivalent.
+- Resource limits use separate guest workload and host VMM cgroups as described
+  above. Live resource updates and the remaining resource controls are not
+  implemented. Management overhead budgets need broader workload measurements.
 - Seccomp, AppArmor, SELinux, and complete namespace semantics are not applied.
   Capability sets and no-new-privileges now have guest child-process enforcement;
   they do not implement the remaining security controls.
-- The OCI hostname is not forwarded to the sandbox. Docker's `--hostname`
-  is ignored, and the generated guest hostname can contain a 64-character
-  label. Python's default HTTP server can fail with `UnicodeError: label too
-  long` when resolving it. Forward and validate the requested hostname and
-  keep generated fallback labels within the 63-character DNS label limit.
+- OCI hostnames are validated and applied to the workload UTS namespace.
+  This does not implement container-name resolution on Docker networks.
 - `kill --all`, `update`, and checkpoint/restore are unsupported.
 - Pause/resume suspends the whole VM while retaining its RAM and host PID. It uses the
   existing Microsandbox pause implementation, not a new OCI cgroup freezer. State queries
@@ -646,7 +729,8 @@ Detached lifecycle, exec, signal, and delete:
 
 ```bash
 docker rm -f msb-sleep 2>/dev/null || true
-docker run -d --name msb-sleep --runtime runmsb ubuntu:latest sleep 300
+docker run -d --name msb-sleep --runtime runmsb ubuntu:latest \
+  sh -c 'trap "exit 143" TERM; while :; do sleep 1 & wait $!; done'
 docker inspect -f '{{.State.Status}} {{.State.Pid}}' msb-sleep
 docker exec msb-sleep /bin/sh -c 'echo EXEC_OK; id; pwd'
 docker kill --signal TERM msb-sleep
@@ -655,7 +739,9 @@ docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' msb-sleep
 docker rm msb-sleep
 ```
 
-The expected wait and inspect exit code after SIGTERM is `143`.
+The expected wait and inspect exit code is `143`: the shell's TERM handler
+chooses that code. Without a handler, a workload running as PID 1 can ignore
+SIGTERM; use SIGKILL to test forced termination (expected code `137`).
 
 Pause and resume the same VM:
 

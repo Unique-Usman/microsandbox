@@ -82,6 +82,7 @@ impl MicrosandboxOciRuntime {
             if let Ok(handle) = Sandbox::get(&sandbox_name_for_container(&options.id)).await {
                 handle.remove().await?;
             }
+            microsandbox_runtime::oci::cgroup::cleanup(&state_dir)?;
             self.store.delete(&options.id)?;
         }
         result
@@ -248,6 +249,7 @@ impl MicrosandboxOciRuntime {
             refreshed.remove().await?;
         }
 
+        microsandbox_runtime::oci::cgroup::cleanup(&self.store.container_dir(&options.id)?)?;
         self.store.delete(&options.id)?;
         Ok(())
     }

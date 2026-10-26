@@ -2,6 +2,7 @@
 #![cfg(all(target_os = "linux", feature = "runmsb"))]
 
 mod console;
+mod isolation;
 mod lock;
 mod options;
 mod process;

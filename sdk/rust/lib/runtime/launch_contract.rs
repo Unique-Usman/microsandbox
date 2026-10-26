@@ -1043,6 +1043,19 @@ pub(crate) async fn require_oci_readonly_root(path: &Path) -> MicrosandboxResult
     Ok(())
 }
 
+#[cfg(feature = "oci-runtime")]
+pub(crate) async fn require_oci_isolation(path: &Path) -> MicrosandboxResult<()> {
+    let output = bounded_probe(path, "__launch-protocol").await?;
+    if !serde_json::from_slice::<LaunchCapabilities>(&output)
+        .is_ok_and(|capabilities| capabilities.protocols.contains(&2) && capabilities.oci_isolation)
+    {
+        return Err(MicrosandboxError::Runtime(upgrade_required(
+            "OCI workload isolation",
+        )));
+    }
+    Ok(())
+}
+
 async fn bounded_probe(path: &Path, argument: &str) -> MicrosandboxResult<Vec<u8>> {
     let mut child = Command::new(path)
         .arg(argument)
@@ -1250,6 +1263,42 @@ mod tests {
         ] {
             let executable = script(dir.path(), name, &format!("printf '%s' '{response}'"));
             let result = require_oci_readonly_root(&executable).await;
+            assert_eq!(result.is_ok(), accepted, "{name}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("upgrade msb"));
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "oci-runtime"))]
+    #[tokio::test]
+    async fn isolation_probe_requires_explicit_support() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, response, accepted) in [
+            ("absent", r#"{"protocols":[2,1]}"#, false),
+            (
+                "disabled",
+                r#"{"protocols":[2],"oci_isolation":false}"#,
+                false,
+            ),
+            (
+                "supported",
+                r#"{"protocols":[2],"oci_isolation":true}"#,
+                true,
+            ),
+            (
+                "wrong-protocol",
+                r#"{"protocols":[1],"oci_isolation":true}"#,
+                false,
+            ),
+            (
+                "malformed",
+                r#"{"protocols":[2],"oci_isolation":"true"}"#,
+                false,
+            ),
+        ] {
+            let executable = script(dir.path(), name, &format!("printf '%s' '{response}'"));
+            let result = require_oci_isolation(&executable).await;
             assert_eq!(result.is_ok(), accepted, "{name}");
             if let Err(error) = result {
                 assert!(error.to_string().contains("upgrade msb"));

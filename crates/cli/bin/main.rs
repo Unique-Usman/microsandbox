@@ -302,6 +302,7 @@ fn main() {
                     protocols: vec![2, 1],
                     required_restore_backing: true,
                     oci_readonly_root: cfg!(all(target_os = "linux", feature = "oci-runtime")),
+                    oci_isolation: cfg!(all(target_os = "linux", feature = "oci-runtime")),
                     tcp_accept_queue_size: true,
                     max_inbound_tcp_connections: cfg!(feature = "net"),
                     http_deny_message: cfg!(feature = "net"),

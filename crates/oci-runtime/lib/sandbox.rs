@@ -4,8 +4,9 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use microsandbox::sandbox::{HostPermissions, MountBuilder, Sandbox, SandboxBuilder};
+use microsandbox_runtime::oci::cgroup::HostCgroupConfig;
 use microsandbox_runtime::oci::{OciBundle, sandbox_name_for_container};
 
 use crate::console::process_console_size;
@@ -37,6 +38,7 @@ pub(crate) async fn create_sandbox_for_bundle(
     console: Option<OwnedFd>,
 ) -> Result<Sandbox> {
     let process = bundle.process();
+    let isolation = crate::isolation::policy(bundle)?;
     let mut builder = Sandbox::builder(sandbox_name_for_container(id))
         .image(bundle.rootfs_path())
         .detached(true)
@@ -66,6 +68,36 @@ pub(crate) async fn create_sandbox_for_bundle(
     }
 
     builder = configure_network_namespace(builder, bundle)?;
+    if let Some(memory) = crate::isolation::guest_memory_mib(&isolation.resources)? {
+        builder = builder.memory(memory);
+    }
+    if let Some(cpus) = crate::isolation::guest_cpus(&isolation.resources)? {
+        builder = builder.cpus(cpus);
+    }
+    builder = builder.label(
+        crate::isolation::ISOLATION_LABEL,
+        serde_json::to_string(&isolation)?,
+    );
+    let host_cgroup = HostCgroupConfig {
+        path: bundle
+            .spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.cgroups_path().as_ref())
+            .map(|path| {
+                path.to_str()
+                    .context("cgroup path is not UTF-8")
+                    .map(str::to_owned)
+            })
+            .transpose()?
+            .unwrap_or_else(|| format!("runmsb/{id}")),
+        state_dir: std::path::absolute(state_dir)?,
+        resources: isolation.resources.clone(),
+    };
+    builder = builder.label(
+        "oci.microsandbox.host_cgroup",
+        serde_json::to_string(&host_cgroup)?,
+    );
     if bundle.spec.root().as_ref().and_then(|root| root.readonly()) == Some(true) {
         builder = builder.label("oci.microsandbox.readonly_root", "true");
     }

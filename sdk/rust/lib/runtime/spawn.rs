@@ -349,6 +349,18 @@ impl LocalBackend {
         if oci_readonly_root(config) {
             launch_contract::require_oci_readonly_root(&resolved_runtime.msb_path).await?;
         }
+        #[cfg(feature = "oci-runtime")]
+        if config
+            .spec
+            .labels
+            .contains_key("oci.microsandbox.isolation")
+            || config
+                .spec
+                .labels
+                .contains_key("oci.microsandbox.host_cgroup")
+        {
+            launch_contract::require_oci_isolation(&resolved_runtime.msb_path).await?;
+        }
         #[cfg(feature = "net")]
         launch_contract::validate_http_deny_response(&resolved_runtime.msb_path, config).await?;
         launch_contract::validate_exec_limits(&resolved_runtime.msb_path, config).await?;
@@ -587,6 +599,21 @@ impl LocalBackend {
         #[cfg(feature = "oci-runtime")]
         if let Some(startup) = launch.startup.as_mut() {
             startup.security = oci_process_security(config)?;
+            startup.isolation = config
+                .spec
+                .labels
+                .get("oci.microsandbox.isolation")
+                .map(|json| serde_json::from_str(json))
+                .transpose()?;
+            #[cfg(target_os = "linux")]
+            {
+                startup.host_cgroup = config
+                    .spec
+                    .labels
+                    .get("oci.microsandbox.host_cgroup")
+                    .map(|json| serde_json::from_str(json))
+                    .transpose()?;
+            }
         }
         tracing::debug!(
             per_disk_limit_bytes = ?writeback_limit_bytes,
@@ -2871,6 +2898,10 @@ fn oci_process_security(
 fn startup_command(config: &SandboxConfig) -> Option<StartupCommand> {
     let (cmd, cmd_args) = resolve_startup_command(config)?;
     Some(StartupCommand {
+        #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+        host_cgroup: None,
+        #[cfg(feature = "oci-runtime")]
+        isolation: None,
         #[cfg(feature = "oci-runtime")]
         security: None,
         cmd,

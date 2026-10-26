@@ -79,6 +79,10 @@ pub struct LaunchCapabilities {
     #[serde(default)]
     pub oci_readonly_root: bool,
 
+    /// OCI workload namespace and cgroup startup support.
+    #[serde(default)]
+    pub oci_isolation: bool,
+
     /// Published-port listeners honor `network.tcp_accept_queue_size`. Older runtimes omit this
     /// feature and would silently ignore the field, so the SDK refuses to send it to them.
     #[serde(default)]
@@ -139,6 +143,14 @@ pub struct MetricsSlotHandoff {
 /// User workload that the sandbox process should start after boot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StartupCommand {
+    /// Host VMM placement applied before guest RAM allocation.
+    #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_cgroup: Option<crate::oci::cgroup::HostCgroupConfig>,
+    /// Create-once guest workload namespace and resource policy.
+    #[cfg(feature = "oci-runtime")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<microsandbox_protocol::isolation::WorkloadIsolation>,
     /// OCI workload security settings for the embedded guest agent.
     #[cfg(feature = "oci-runtime")]
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -765,6 +765,17 @@ fn run(
         .build()
         .map_err(|e| RuntimeError::Custom(format!("tokio runtime: {e}")))?;
 
+    // Memory charges stay with their original cgroup after migration. Place this
+    // process before constructing the VM, not after it has allocated guest RAM.
+    #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
+    if let Some(group) = config
+        .startup_command
+        .as_ref()
+        .and_then(|command| command.host_cgroup.as_ref())
+    {
+        tokio_rt.block_on(crate::oci::cgroup::place(group, pid as i32))?;
+    }
+
     let startup_progress: crate::startup_progress::StartupProgressCallback = match startup_writer {
         Some(writer) => super::progress::start(
             writer,
@@ -2143,7 +2154,11 @@ fn build_vm(
                 fs.tag(microsandbox_protocol::bootstrap::READ_ONLY_ROOTFS_TAG)
                     .custom(Box::new(backend))
             });
-            let trampoline = bootstrap_trampoline_backend(vm.fs_state_limit())?;
+            let (trampoline, rootfs_dir) = bootstrap_trampoline_backend(
+                vm.fs_state_limit(),
+                &config.sandboxes_dir.join(&config.sandbox_name),
+            )?;
+            trampoline_rootfs_dirs.push(rootfs_dir);
             builder = builder.fs(move |fs| fs.tag("/dev/root").custom(Box::new(trampoline)));
         } else {
             let backend = bind_rootfs_backend(
@@ -4653,6 +4668,8 @@ mod tests {
             agent_sock_path: scratch.join("agent.sock"),
             startup_command: None,
             startup_fd: None,
+            #[cfg(feature = "oci-runtime")]
+            startup_console: None,
             parent_watchdog: None,
             forward_output: false,
             idle_timeout_secs: None,
