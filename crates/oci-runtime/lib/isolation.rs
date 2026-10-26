@@ -121,12 +121,36 @@ pub(crate) fn guest_cpus(resources: &WorkloadResources) -> Result<Option<u8>> {
 }
 
 fn resource_policy(resources: &LinuxResources) -> Result<WorkloadResources> {
+    if let Some(block_io) = resources.block_io() {
+        // Docker emits blockIO even without limits; older versions also emit weight: 0.
+        ensure!(
+            block_io.weight().is_none_or(|weight| weight == 0)
+                && block_io.leaf_weight().is_none_or(|weight| weight == 0)
+                && block_io.weight_device().as_ref().is_none_or(Vec::is_empty)
+                && block_io
+                    .throttle_read_bps_device()
+                    .as_ref()
+                    .is_none_or(Vec::is_empty)
+                && block_io
+                    .throttle_write_bps_device()
+                    .as_ref()
+                    .is_none_or(Vec::is_empty)
+                && block_io
+                    .throttle_read_iops_device()
+                    .as_ref()
+                    .is_none_or(Vec::is_empty)
+                && block_io
+                    .throttle_write_iops_device()
+                    .as_ref()
+                    .is_none_or(Vec::is_empty),
+            "guest block I/O resource controls are not implemented"
+        );
+    }
     ensure!(
-        resources.block_io().is_none()
-            && resources
-                .hugepage_limits()
-                .as_ref()
-                .is_none_or(Vec::is_empty)
+        resources
+            .hugepage_limits()
+            .as_ref()
+            .is_none_or(Vec::is_empty)
             && resources.network().is_none()
             && resources
                 .rdma()
@@ -136,7 +160,7 @@ fn resource_policy(resources: &LinuxResources) -> Result<WorkloadResources> {
                 .unified()
                 .as_ref()
                 .is_none_or(|value| value.is_empty()),
-        "guest I/O, hugepage, network, RDMA and arbitrary unified cgroup controls are not implemented"
+        "guest hugepage, network, RDMA and arbitrary unified cgroup controls are not implemented"
     );
     let mut result = WorkloadResources::default();
     if let Some(cpu) = resources.cpu() {
@@ -302,6 +326,54 @@ mod tests {
         assert_eq!(mapped.pids_max, Some(32));
         assert_eq!(guest_memory_mib(&mapped).unwrap(), Some(640));
         assert_eq!(guest_cpus(&mapped).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn accepts_docker_empty_block_io_without_losing_supported_limits() {
+        for block_io in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"weight": 0}),
+            serde_json::json!({
+                "weight": 0, "leafWeight": 0, "weightDevice": [],
+                "throttleReadBpsDevice": [], "throttleWriteBpsDevice": [],
+                "throttleReadIOPSDevice": [], "throttleWriteIOPSDevice": []
+            }),
+        ] {
+            let resources = serde_json::from_value(serde_json::json!({
+                "blockIO": block_io,
+                "cpu": {"quota": 50000, "period": 100000},
+                "memory": {"limit": 67108864, "swap": 67108864},
+                "pids": {"limit": 8}
+            }))
+            .unwrap();
+
+            let mapped = resource_policy(&resources).unwrap();
+            assert_eq!(mapped.cpu_quota, Some(50000));
+            assert_eq!(mapped.cpu_period, Some(100000));
+            assert_eq!(mapped.memory_max, Some(67108864));
+            assert_eq!(mapped.swap_max, Some(0));
+            assert_eq!(mapped.pids_max, Some(8));
+        }
+    }
+
+    #[test]
+    fn rejects_every_requested_block_io_control() {
+        for block_io in [
+            serde_json::json!({"weight": 500}),
+            serde_json::json!({"leafWeight": 500}),
+            serde_json::json!({"weightDevice": [{"major": 8, "minor": 0, "weight": 500}]}),
+            serde_json::json!({"throttleReadBpsDevice": [{"major": 8, "minor": 0, "rate": 1024}]}),
+            serde_json::json!({"throttleWriteBpsDevice": [{"major": 8, "minor": 0, "rate": 1024}]}),
+            serde_json::json!({"throttleReadIOPSDevice": [{"major": 8, "minor": 0, "rate": 10}]}),
+            serde_json::json!({"throttleWriteIOPSDevice": [{"major": 8, "minor": 0, "rate": 10}]}),
+        ] {
+            let resources =
+                serde_json::from_value(serde_json::json!({"blockIO": block_io})).unwrap();
+
+            let error = resource_policy(&resources).unwrap_err();
+            assert!(error.to_string().contains("block I/O"), "{error}");
+        }
     }
 
     #[test]

@@ -104,6 +104,10 @@ requested controller is rejected.
 CPU sets, realtime/burst/idle controls, memory reservation/swappiness/OOM-disable,
 I/O, hugepages, RDMA, arbitrary unified controls and live `update` are unsupported.
 Device allow/deny rules remain accepted but unenforced compatibility fields.
+Docker's empty `blockIO` object, including zero default weights and empty device
+lists, does not request an I/O limit and is accepted. Nonzero weights and any
+per-device I/O rules are still rejected; accepting the empty object does not
+provide block-I/O enforcement.
 
 PID 1 has Linux init signal semantics: applications should handle termination
 and reap children. Killing workload PID 1 tears down its PID namespace; exec
