@@ -60,6 +60,7 @@ type SandboxConfig struct {
 	MaxDuration        time.Duration
 	IdleTimeout        time.Duration
 	RegistryAuth       *RegistryAuth
+	registryAnonymous  bool
 	// RegistryInsecure pulls the image over plain HTTP instead of HTTPS.
 	RegistryInsecure bool
 	// RegistryCACerts holds PEM-encoded CA root certificates trusted when
@@ -909,6 +910,16 @@ func WithRegistryAuth(auth RegistryAuth) SandboxOption {
 	return func(o *SandboxConfig) {
 		a := auth
 		o.RegistryAuth = &a
+		o.registryAnonymous = false
+	}
+}
+
+// WithRegistryAnonymous pulls without credentials, even when the OS keyring,
+// registry configuration or Docker's credential store has some for the registry.
+func WithRegistryAnonymous() SandboxOption {
+	return func(o *SandboxConfig) {
+		o.RegistryAuth = nil
+		o.registryAnonymous = true
 	}
 }
 
@@ -1143,13 +1154,13 @@ func SOCKS5Proxy(address string) *OutboundProxy {
 }
 
 // HTTPConnectProxy configures an HTTP proxy that opens outbound TCP tunnels
-// with CONNECT at address.
+// with CONNECT at address. Add Credentials for HTTP Basic authentication.
 func HTTPConnectProxy(address string) *OutboundProxy {
 	return &OutboundProxy{protocol: "http_connect", address: address}
 }
 
-// Credentials returns a copy configured with SOCKS5 username authentication
-// and a host-side password source.
+// Credentials returns a copy configured with SOCKS5 or HTTP CONNECT username
+// authentication and a host-side password source.
 func (p *OutboundProxy) Credentials(username string, password SecretSource) *OutboundProxy {
 	if p == nil {
 		return nil
@@ -1205,6 +1216,9 @@ type NetworkConfig struct {
 	// 1 to 2147483647. Nil keeps the default, 1024; the host kernel clamps it to its somaxconn.
 	TCPAcceptQueueSize *uint32
 
+	// MaxInboundTCPConnections caps active inbound TCP connections; zero is unlimited. Nil uses the runtime default.
+	MaxInboundTCPConnections *uint
+
 	// IPv4Pool is used to derive per-sandbox /30 guest subnets.
 	// Defaults to "172.16.0.0/12".
 	IPv4Pool string
@@ -1239,13 +1253,32 @@ type NetworkConfig struct {
 	HTTP *HTTPConfig
 }
 
+// HTTPDenyResponseFormat selects the denial response contract.
+type HTTPDenyResponseFormat string
+
+const (
+	// HTTPDenyResponseText preserves legacy plain-text network denials.
+	HTTPDenyResponseText HTTPDenyResponseFormat = "text"
+	// HTTPDenyResponseJSON enables JSON network and secret denials.
+	HTTPDenyResponseJSON HTTPDenyResponseFormat = "json"
+)
+
 // HTTPConfig configures HTTP denial responses.
 type HTTPConfig struct {
-	// DenyResponse enables readable HTTP denial responses. Default: false.
-	DenyResponse bool
-	// DenyMessage replaces the body when DenyResponse is enabled.
-	// "{host}" names the blocked host. Empty uses the default message.
+	// DenyResponseFormat defaults to JSON when empty.
+	DenyResponseFormat HTTPDenyResponseFormat
+	// DenyMessage sets the legacy text message with {host} substitution.
+	// Deprecated: use JSON mode and NetworkDenyMessage for new integrations.
 	DenyMessage string
+	// DenyResponse enables readable HTTP denial responses. A nil HTTP config enables JSON
+	// responses by default; when supplying HTTPConfig, set true to keep them enabled.
+	DenyResponse bool
+	// NetworkDenyMessage sets the network-denial JSON message in JSON mode. Requires DenyResponse.
+	// Used as-is. Empty uses the default message.
+	NetworkDenyMessage string
+	// SecretDenyMessage sets the literal secret-denial JSON message.
+	// Empty uses the default message. Requires DenyResponse and JSON mode.
+	SecretDenyMessage string
 }
 
 // DNSConfig configures the in-VM DNS proxy.

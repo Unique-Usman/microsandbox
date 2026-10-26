@@ -1,6 +1,9 @@
 //! Sandbox modification planning.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use microsandbox_types::{
     EnvVar, RootDisk, RootfsSource, SecretSubstitution, SecretViolationAction,
@@ -13,17 +16,20 @@ use crate::error::{Operation, UnsupportedReason};
 use crate::size::Mebibytes;
 use crate::{MicrosandboxError, MicrosandboxResult};
 use microsandbox_control_client::{
-    CompactDisks, CreateCheckpoint, CreateDiskCheckpoint, GetCpuState, GetMemoryState,
     GrowRootDisk, SecretsResult, SetCpuTarget, SetMemoryTarget, UpdateSecrets,
 };
 
 use super::{SandboxConfig, SandboxStatus};
 
+#[path = "modify_ports.rs"]
+mod ports;
+
 pub use microsandbox_types::modify::{
     ChangeKind, ConfigPlannedChange, ModificationConflict, ModificationDisposition,
-    ModificationPolicy, ModificationWarning, PlannedChange, ResourceConvergenceState, ResourceKind,
-    ResourceResizeStatus, SandboxModificationPatch, SandboxModificationPlan, SecretChangeKind,
-    SecretModificationPatch, SecretPlannedChange, SecretSource,
+    ModificationPolicy, ModificationWarning, PlannedChange, PublishedPortKey,
+    ResourceConvergenceState, ResourceKind, ResourceResizeStatus, SandboxModificationPatch,
+    SandboxModificationPlan, SecretChangeKind, SecretModificationPatch, SecretPlannedChange,
+    SecretSource,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -38,8 +44,8 @@ const SECRET_POLICY_REQUIRES_RESTART: &str =
     "secret policy changes require restart; use restart or next_start";
 const LIVE_EXEC_DEFAULT_UPDATE_UNAVAILABLE: &str =
     "affects future execs only after restart; live exec-default updates are not available yet";
-const LIVE_LABEL_UPDATE_UNAVAILABLE: &str =
-    "live label updates are not available in this runtime yet";
+const LIVE_LABEL_UPDATE_NEEDS_ACTIVE_CONFIG: &str =
+    "live label updates need an active configuration snapshot; restart the sandbox to apply them";
 const UPPER_LIVE_RESIZE_UNAVAILABLE: &str =
     "the mounted upper filesystem cannot be resized while the sandbox is running";
 const UPPER_GROWS_ON_NEXT_START: &str =
@@ -102,6 +108,14 @@ struct ExistingSecret {
     require_tls_identity: bool,
 }
 
+/// A compare-guarded replacement of the sandbox row's `active_config`.
+struct ActiveLabelsUpdate {
+    /// The `active_config` value the write expects to find.
+    expected_json: String,
+    /// The `active_config` value to store.
+    active_config_json: String,
+}
+
 /// Live-control operations the running sandbox process actually serves,
 /// discovered through the control socket's `capabilities` op.
 #[derive(Debug, Clone, Copy, Default)]
@@ -114,12 +128,6 @@ struct LiveControl {
 
     /// Secret rotation, removal, and allowed-host updates are served.
     secrets: bool,
-}
-
-/// A published runtime checkpoint and the independent outcome of source recovery.
-pub(crate) struct CheckpointCaptureOutcome {
-    pub(crate) checkpoint: microsandbox_protocol::control::CheckpointState,
-    pub(crate) recovery_error: Option<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -198,6 +206,28 @@ impl SandboxModificationBuilder {
         self
     }
 
+    /// Add or update a published mapping without changing other host endpoints.
+    /// This requires restart or next-start policy on a running sandbox.
+    pub fn port(self, host_port: u16, guest_port: u16) -> Self {
+        self.port_mapping(microsandbox_types::PublishedPortSpec {
+            host_port,
+            guest_port,
+            ..Default::default()
+        })
+    }
+
+    /// Add or update a mapping with an explicit host address and protocol.
+    pub fn port_mapping(mut self, port: microsandbox_types::PublishedPortSpec) -> Self {
+        self.patch.ports.push(port);
+        self
+    }
+
+    /// Remove one published host endpoint. Missing endpoints are rejected.
+    pub fn remove_port(mut self, port: PublishedPortKey) -> Self {
+        self.patch.ports_remove.push(port);
+        self
+    }
+
     /// Persist the requested changes for the next start.
     pub fn next_start(mut self) -> Self {
         self.policy = ModificationPolicy::NextStart;
@@ -266,22 +296,35 @@ impl SandboxModificationBuilder {
         let active = handle.active_config().ok().flatten();
         let (live, _) =
             live_control(&self.backend, &self.name, status, &self.patch, self.policy).await?;
-        Ok(build_plan(
+        let mut plan = build_plan(
             self.name,
             status,
             &config,
             active.as_ref(),
             live,
-            self.patch,
+            self.patch.clone(),
             self.policy,
-        ))
+        );
+        if ports::requested(&self.patch) && plan.conflicts.is_empty() {
+            if handle.local().is_none() {
+                return Err(MicrosandboxError::local_only(Operation::SandboxModify));
+            }
+            if let Err(error) = ports::preflight(&config, active.as_ref(), &self.patch, status) {
+                plan.conflicts.push(ModificationConflict {
+                    field: "port".into(),
+                    message: error.to_string(),
+                });
+            }
+        }
+        Ok(plan)
     }
 
     /// Apply supported changes, preserving any earlier live effects on failure.
     ///
     /// Live-capable changes apply to the running VM first (CPU count through
     /// guest CPU hotplug when the target fits inside the active `max_cpus`);
-    /// the desired config is persisted only after the live step succeeds. For
+    /// the desired config is persisted only after the live step succeeds, and
+    /// live label changes are saved with it. For
     /// stopped sandboxes or `next_start` requests, changes persist for the next
     /// start. When the policy is `restart`, the existing stop/start lifecycle
     /// path makes restart-required changes active. Live secret rotation,
@@ -324,15 +367,36 @@ impl SandboxModificationBuilder {
         );
 
         validate_apply_supported(&plan)?;
+        if ports::requested(&self.patch) {
+            if handle.local().is_none() {
+                return Err(MicrosandboxError::local_only(Operation::SandboxModify));
+            }
+            ports::preflight(&config, active.as_ref(), &self.patch, status)?;
+        }
+        let restart_required = plan_requires_restart(&plan) && running_status(status);
+
         if handle.local().is_some() {
             // Validate configuration serialization before stopping a VM,
             // growing a disk, or issuing any live control mutation.
             let mut prospective = config.clone();
-            apply_patch_to_config(&mut prospective, &self.patch);
-            apply_secret_patch_to_config(&mut prospective, &self.patch)?;
+            prospective.apply_modification(&self.patch);
+            prospective.update_secrets(&self.patch)?;
             serde_json::to_string(&prospective)?;
+
+            // A restart-backed modification must be launchable on the selected
+            // runtime before the VM is stopped. Otherwise a capability gap (for
+            // example HTTP CONNECT proxy authentication) is only discovered by
+            // the start that follows `stop`, which leaves the workload down and
+            // the rejected change already persisted.
+            if restart_required && let Some(local) = self.backend.as_local() {
+                crate::runtime::launch_contract::validate_runtime_config(
+                    &prospective,
+                    local.config(),
+                )
+                .await?;
+            }
         }
-        let restart_required = plan_requires_restart(&plan) && running_status(status);
+
         if restart_required {
             handle.stop().await?;
         }
@@ -407,7 +471,7 @@ impl SandboxModificationBuilder {
                 // into the active snapshot so inspect does not report the
                 // already-live change as pending.
                 if let Some(active) = active.as_mut() {
-                    apply_secret_patch_to_config(active, &self.patch)?;
+                    active.update_secrets(&self.patch)?;
                     persist_active_config(
                         &self.backend,
                         control_session(&session)?,
@@ -440,7 +504,7 @@ impl SandboxModificationBuilder {
                     root_disk_size_mib: Some(target_mib),
                     ..Default::default()
                 };
-                apply_patch_to_config(active, &disk_patch);
+                active.apply_modification(&disk_patch);
                 persist_active_config(
                     &self.backend,
                     control_session(&session)?,
@@ -460,9 +524,22 @@ impl SandboxModificationBuilder {
             grow_root_disk_now(&self.backend, &self.name, &config, target_mib).await?;
         }
         if !plan.changes.is_empty() {
-            apply_patch_to_config(&mut config, &self.patch);
-            apply_secret_patch_to_config(&mut config, &self.patch)?;
-            persist_config(&self.backend, &handle, &config).await?;
+            config.apply_modification(&self.patch);
+            config.update_secrets(&self.patch)?;
+            let active_labels = if !restart_required && has_live_label_change(&plan) {
+                let (Some(active), Some(expected_json)) = (active.as_mut(), active_json.clone())
+                else {
+                    return Err(MicrosandboxError::ControlStateChanged);
+                };
+                active.update_labels(&self.patch);
+                Some(ActiveLabelsUpdate {
+                    expected_json,
+                    active_config_json: serde_json::to_string(active)?,
+                })
+            } else {
+                None
+            };
+            persist_config(&self.backend, &handle, &config, active_labels).await?;
         }
         if restart_required {
             start_after_modify(&handle).await?;
@@ -557,10 +634,227 @@ impl SecretPatchBuilder {
     }
 }
 
+impl SandboxConfig {
+    /// Apply planned settings to this config and update the saved caller overrides.
+    ///
+    /// Only changed fields are recorded, so unrelated inherited defaults remain
+    /// free to change on rebuild. Secret changes are applied separately. This
+    /// updates configuration in memory; it does not persist it or change the VM.
+    fn apply_modification(&mut self, patch: &SandboxModificationPatch) {
+        let config_patch = self.config_patch_for_modification(patch);
+        config_patch.clone().apply_to(self);
+
+        // Effective resource targets must fit even when their maximum is inherited.
+        self.spec.resources.max_cpus = self.spec.resources.max_cpus.max(self.spec.resources.cpus);
+        self.spec.resources.max_memory_mib = self
+            .spec
+            .resources
+            .max_memory_mib
+            .max(self.spec.resources.memory_mib);
+
+        self.caller_config_overrides
+            .get_or_insert_with(Default::default)
+            .overlay_mut(config_patch);
+    }
+
+    /// Translate modification operations into values that can be applied and saved.
+    ///
+    /// Resolve removals and dependent settings against the current config. Keep
+    /// this destructuring exhaustive so adding a modification field requires handling it
+    /// here, or explicitly delegating it to a separate path such as secrets.
+    fn config_patch_for_modification(
+        &self,
+        patch: &SandboxModificationPatch,
+    ) -> super::SandboxConfigPatch {
+        let SandboxModificationPatch {
+            cpus,
+            max_cpus,
+            memory_mib,
+            max_memory_mib,
+            root_disk_size_mib,
+            env,
+            env_remove,
+            labels,
+            labels_remove,
+            ports,
+            ports_remove,
+            workdir,
+            // Secrets are validated and recorded by update_secrets.
+            secrets: _,
+            secrets_remove: _,
+        } = patch;
+
+        let mut result = super::SandboxConfigPatch::new();
+        let spec = &mut result.spec;
+        spec.resources.cpus = *cpus;
+        spec.resources.memory_mib = *memory_mib;
+        spec.runtime.workdir = workdir.clone().map(Some);
+
+        // Keep a previously explicit maximum in sync when resizing raises it.
+        // Otherwise leave inherited capacity out of the saved caller overrides.
+        let saved = self.caller_config_overrides.as_deref();
+        spec.resources.max_cpus = max_cpus
+            .or_else(|| {
+                cpus.and_then(|_| {
+                    saved
+                        .and_then(|saved| saved.spec.resources.max_cpus)
+                        .map(|_| self.spec.resources.max_cpus)
+                })
+            })
+            .map(|maximum| maximum.max(cpus.unwrap_or(self.spec.resources.cpus)));
+        spec.resources.max_memory_mib = max_memory_mib
+            .or_else(|| {
+                memory_mib.and_then(|_| {
+                    saved
+                        .and_then(|saved| saved.spec.resources.max_memory_mib)
+                        .map(|_| self.spec.resources.max_memory_mib)
+                })
+            })
+            .map(|maximum| maximum.max(memory_mib.unwrap_or(self.spec.resources.memory_mib)));
+
+        if let Some(size_mib) = root_disk_size_mib {
+            let mut image = self.spec.image.clone();
+            if let RootfsSource::Oci(oci) = &mut image {
+                match &mut oci.root_disk {
+                    Some(RootDisk::Managed { size_mib: size })
+                    | Some(RootDisk::Tmpfs { size_mib: size })
+                    | Some(RootDisk::Flat { size_mib: size, .. }) => *size = Some(*size_mib),
+                    // The planner rejects resizing user-owned disk images.
+                    Some(RootDisk::DiskImage { .. }) => {}
+                    None => {
+                        oci.root_disk = Some(RootDisk::Managed {
+                            size_mib: Some(*size_mib),
+                        })
+                    }
+                }
+            }
+            spec.image = Some(image);
+        }
+
+        if !env.is_empty() || !env_remove.is_empty() {
+            let mut environment = self.spec.env.clone();
+            for var in patched_env(patch) {
+                let Some(last) = environment.iter().rposition(|entry| entry.key == var.key) else {
+                    environment.push(var.clone());
+                    continue;
+                };
+                // Preserve duplicates for unchanged values; otherwise update the
+                // last entry (the one commands see) and remove earlier copies.
+                if environment[last].value == var.value {
+                    continue;
+                }
+                let mut rest = environment.split_off(last);
+                rest[0].value = var.value.clone();
+                environment.retain(|entry| entry.key != var.key);
+                environment.append(&mut rest);
+            }
+            environment.retain(|entry| !env_remove.contains(&entry.key));
+            spec.replace_env_mut(environment);
+        }
+
+        if !labels.is_empty() || !labels_remove.is_empty() {
+            let mut updated = self.spec.labels.clone();
+            updated.extend(labels.iter().cloned());
+            updated.retain(|key, _| !labels_remove.contains(key));
+            spec.replace_labels_mut(updated);
+        }
+
+        if !ports.is_empty() || !ports_remove.is_empty() {
+            // The planner validated the complete resulting set before mutation.
+            spec.network.ports = Some(ports::desired(self, patch));
+        }
+
+        result
+    }
+
+    /// Update labels in this config without recording overrides or persisting it.
+    ///
+    /// Also used for the running config when labels are applied live; the full
+    /// modification path records caller overrides on the desired config.
+    fn update_labels(&mut self, patch: &SandboxModificationPatch) {
+        for (key, value) in &patch.labels {
+            self.spec.labels.insert(key.clone(), value.clone());
+        }
+        for key in &patch.labels_remove {
+            self.spec.labels.remove(key);
+        }
+    }
+
+    /// Validate and apply secret changes, then record the resulting secret and TLS overrides.
+    /// This updates configuration in memory; persistence and live delivery are separate.
+    ///
+    /// A source-based spec records the host-side reference and drops any
+    /// previously inlined raw value; the value is resolved from the source at
+    /// spawn time. A value-based spec persists the value into the entry — the
+    /// documented at-rest property shared with create's `secret_env` — until a
+    /// later source-based rotate migrates the entry to a reference.
+    #[cfg(feature = "net")]
+    fn update_secrets(&mut self, patch: &SandboxModificationPatch) -> MicrosandboxResult<()> {
+        if patch.secrets.is_empty() && patch.secrets_remove.is_empty() {
+            return Ok(());
+        }
+
+        let mut network = self.local_network_config()?;
+        for spec in &patch.secrets {
+            apply_secret_spec(&mut network.secrets, spec)?;
+        }
+        network
+            .secrets
+            .secrets
+            .retain(|entry| !patch.secrets_remove.contains(&entry.env_var));
+
+        // TLS-identity secrets require interception; deliberate plain-HTTP
+        // secrets do not. This is one-way because TLS may have been enabled for
+        // independent reasons.
+        if !network.tls.enabled && network.secrets.has_tls_identity_secrets() {
+            network.tls.enabled = true;
+        }
+
+        // Enforce env-var and placeholder shape rules before anything persists;
+        // validation errors carry entry indexes and sizes, never values.
+        network.secrets.validate().map_err(|err| {
+            crate::MicrosandboxError::InvalidConfig(format!("invalid secret configuration: {err}"))
+        })?;
+
+        self.set_local_network_config(network)?;
+
+        let caller_overrides = self
+            .caller_config_overrides
+            .get_or_insert_with(Default::default);
+        caller_overrides.spec.network.secrets = self
+            .spec
+            .network
+            .secrets
+            .clone()
+            .map(microsandbox_types::SecretsConfigPatch::from_present_fields);
+        caller_overrides.spec.network.tls = self
+            .spec
+            .network
+            .tls
+            .clone()
+            .map(microsandbox_types::TlsConfigPatch::from_present_fields);
+        Ok(())
+    }
+
+    /// Accept an unchanged secret configuration; reject secret edits without networking support.
+    #[cfg(not(feature = "net"))]
+    fn update_secrets(&mut self, patch: &SandboxModificationPatch) -> MicrosandboxResult<()> {
+        if patch.secrets.is_empty() && patch.secrets_remove.is_empty() {
+            return Ok(());
+        }
+        Err(crate::MicrosandboxError::unsupported(
+            Operation::SandboxModify,
+            UnsupportedReason::RequiresCrateFeature("net"),
+        ))
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+/// Classify requested changes as live, deferred, or conflicting without applying them.
+/// Uses both desired and running settings, plus the runtime's available controls.
 #[allow(clippy::too_many_arguments)]
 fn build_plan(
     name: String,
@@ -603,7 +897,24 @@ fn build_plan(
             }
         }
     }
-    push_spec_changes(status, config, &patch, policy, &mut changes, &mut warnings);
+    push_spec_changes(
+        status,
+        config,
+        active,
+        &patch,
+        policy,
+        &mut changes,
+        &mut warnings,
+    );
+    ports::plan(
+        status,
+        config,
+        active,
+        &patch,
+        policy,
+        &mut changes,
+        &mut conflicts,
+    );
     push_secret_changes(
         status,
         config,
@@ -775,366 +1086,6 @@ fn control_session(session: &Option<ControlSession>) -> MicrosandboxResult<&Cont
     })
 }
 
-/// Retain the protocol session only when it matches an earlier identity-bearing selection.
-pub(super) async fn control_session_for_run(
-    local: &crate::backend::LocalBackend,
-    name: &str,
-    run: super::identity::SandboxRunIdentity,
-) -> MicrosandboxResult<ControlSession> {
-    let session = local.control_session(name).await?.ok_or_else(|| {
-        MicrosandboxError::Runtime("runtime control endpoint is unavailable".into())
-    })?;
-    if !session.matches_run(run) {
-        return Err(MicrosandboxError::ControlClient(Arc::new(
-            microsandbox_control_client::ControlClientError::RuntimeChanged,
-        )));
-    }
-    Ok(session)
-}
-
-/// Project restored live targets into configuration after construction used original geometry.
-pub(crate) async fn restore_requested_resources(
-    local: &crate::backend::LocalBackend,
-    config: &mut super::SandboxConfig,
-) -> MicrosandboxResult<()> {
-    let resources = &config.spec.resources;
-    let session =
-        if resources.max_cpus > resources.cpus || resources.max_memory_mib > resources.memory_mib {
-            // The restored sandbox is still `Starting` here: readiness is published after this.
-            local
-                .control_session_while_starting(&config.spec.name)
-                .await?
-        } else {
-            None
-        };
-    let mut cpus = resources.cpus;
-    let mut memory_mib = resources.memory_mib;
-    // libkrun creates the CPU controller only when capacity exceeds boot CPUs.
-    // A fixed multi-CPU VM has no controller; its captured boot count is already final.
-    if resources.max_cpus > resources.cpus {
-        let state = control_session(&session)?
-            .request(&GetCpuState)
-            .await
-            .map_err(MicrosandboxError::ControlClient)?;
-        if state.possible != u32::from(resources.max_cpus)
-            || state.requested_online == 0
-            || state.requested_online > state.possible
-        {
-            return Err(crate::MicrosandboxError::Runtime(
-                "restored CPU target is outside captured capacity".into(),
-            ));
-        }
-        cpus = state.requested_online as u8;
-    }
-    if resources.max_memory_mib > resources.memory_mib {
-        let state = control_session(&session)?
-            .request(&GetMemoryState)
-            .await
-            .map_err(MicrosandboxError::ControlClient)?;
-        if state.boot_mib != u64::from(resources.memory_mib)
-            || state.max_mib != u64::from(resources.max_memory_mib)
-            || state.target_mib < state.boot_mib
-            || state.target_mib > state.max_mib
-        {
-            return Err(crate::MicrosandboxError::Runtime(
-                "restored memory target is outside captured capacity".into(),
-            ));
-        }
-        memory_mib = state.target_mib as u32;
-    }
-    // Persist requested targets, not the boot values or possibly still-converging actual values,
-    // so subsequent modify calls neither silently skip changes nor claim false convergence.
-    config.spec.resources.cpus = cpus;
-    config.spec.resources.memory_mib = memory_mib;
-    Ok(())
-}
-
-/// Bind the command to the selected process before sending any bytes on a reusable endpoint.
-#[cfg(all(test, unix))]
-pub(super) async fn control_request_for_run(
-    local: &crate::backend::LocalBackend,
-    name: &str,
-    run: super::identity::SandboxRunIdentity,
-    request: String,
-) -> MicrosandboxResult<microsandbox_runtime::control::ControlResponse> {
-    control_request_for_run_with_memory(local, name, run, request, None).await
-}
-
-/// Optional descriptor travels with the first request byte on the already authenticated socket.
-#[cfg(any(target_os = "linux", all(test, unix)))]
-pub(super) async fn control_request_for_run_with_memory(
-    local: &crate::backend::LocalBackend,
-    name: &str,
-    run: super::identity::SandboxRunIdentity,
-    request: String,
-    _memory: Option<&std::fs::File>,
-) -> MicrosandboxResult<microsandbox_runtime::control::ControlResponse> {
-    let candidates = crate::runtime::sandbox_agent_socket_path_candidates_for(local, name)
-        .into_iter()
-        .map(|path| microsandbox_runtime::control::control_socket_path_for(&path));
-    #[cfg(unix)]
-    let stream = connect_control_socket(candidates).await?;
-    let peer_pid = control_peer_pid(&stream)?;
-    if peer_pid != run.pid {
-        return Err(MicrosandboxError::Runtime(format!(
-            "sandbox {name:?} control endpoint belongs to pid {peer_pid}, expected {}",
-            run.pid
-        )));
-    }
-    local.validate_control_run(name, run).await?;
-    #[cfg(target_os = "linux")]
-    let request = if let Some(memory) = _memory {
-        use std::os::fd::AsRawFd;
-        let first = *request
-            .as_bytes()
-            .first()
-            .ok_or_else(|| MicrosandboxError::Runtime("empty control request".into()))?;
-        loop {
-            stream.writable().await?;
-            match stream.try_io(tokio::io::Interest::WRITABLE, || {
-                microsandbox_runtime::memory_handoff::send_first(stream.as_raw_fd(), memory, first)
-            }) {
-                Ok(()) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        request[1..].to_owned()
-    } else {
-        request
-    };
-    let response = control_request_over_stream(stream, &request).await?;
-    if !response.ok {
-        return Err(MicrosandboxError::Runtime(format!(
-            "runtime control refused: {}",
-            response.error.unwrap_or_else(|| "unknown error".into())
-        )));
-    }
-    Ok(response)
-}
-
-#[cfg(target_os = "linux")]
-fn control_peer_pid(stream: &tokio::net::UnixStream) -> std::io::Result<i32> {
-    stream.peer_cred()?.pid().ok_or_else(|| {
-        std::io::Error::other("control endpoint did not report its process identity")
-    })
-}
-
-#[cfg(all(test, target_os = "macos"))]
-fn control_peer_pid(stream: &tokio::net::UnixStream) -> std::io::Result<i32> {
-    use std::os::fd::AsRawFd;
-    let mut pid: libc::pid_t = 0;
-    let mut size = std::mem::size_of_val(&pid) as libc::socklen_t;
-    // LOCAL_PEERPID identifies the server attached to this connected socket, not a later
-    // process that reuses its filesystem pathname. getpeereid alone exposes only UID/GID.
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            (&mut pid as *mut libc::pid_t).cast(),
-            &mut size,
-        )
-    };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if size as usize != std::mem::size_of_val(&pid) || pid <= 0 {
-        return Err(std::io::Error::other(
-            "invalid control endpoint process identity",
-        ));
-    }
-    Ok(pid)
-}
-
-#[cfg(all(test, unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn control_peer_pid(_stream: &tokio::net::UnixStream) -> std::io::Result<i32> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "control endpoint process verification is unsupported on this platform",
-    ))
-}
-
-#[cfg(any(target_os = "linux", all(test, unix)))]
-async fn connect_control_socket(
-    candidates: impl IntoIterator<Item = std::path::PathBuf>,
-) -> std::io::Result<tokio::net::UnixStream> {
-    let mut last_error = None;
-    for path in candidates {
-        if !path.exists() {
-            continue;
-        }
-        match tokio::net::UnixStream::connect(&path).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = Some(error),
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no runtime control endpoint exists",
-        )
-    }))
-}
-
-/// Send and receive one control exchange over an already-connected transport.
-#[cfg(any(target_os = "linux", all(test, unix)))]
-async fn control_request_over_stream<S>(
-    mut stream: S,
-    request: &str,
-) -> MicrosandboxResult<microsandbox_runtime::control::ControlResponse>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|e| crate::MicrosandboxError::Runtime(format!("control request failed: {e}")))?;
-
-    let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .await
-        .map_err(|e| crate::MicrosandboxError::Runtime(format!("control response failed: {e}")))?;
-    let response: microsandbox_runtime::control::ControlResponse =
-        serde_json::from_str(line.trim())?;
-    Ok(response)
-}
-
-/// Capability-gated disk maintenance over the existing control endpoint.
-pub(crate) async fn control_disk_compact(
-    local: &crate::backend::LocalBackend,
-    name: &str,
-    target: microsandbox_types::DiskCompactionTarget,
-    layers: Option<usize>,
-    dry_run: bool,
-) -> MicrosandboxResult<super::DiskCompactionResult> {
-    // Discovery and mutation must use the same retained backend as the selected sandbox.
-    // An ambient backend may contain a different sandbox with this exact name.
-    let session = local.control_session(name).await?.ok_or_else(|| {
-        crate::MicrosandboxError::Runtime("runtime control endpoint is unavailable".into())
-    })?;
-    let capabilities = session.capabilities();
-    if !capabilities.disk_compact_owned {
-        return Err(crate::MicrosandboxError::Runtime(
-            "this running sandbox does not support disk compaction; restart with the updated runtime".into(),
-        ));
-    }
-    session
-        .request(&CompactDisks(microsandbox_protocol::control::DiskCompact {
-            target,
-            layers: layers.map(|value| value as u64),
-            dry_run,
-        }))
-        .await
-        .map_err(crate::MicrosandboxError::ControlClient)
-}
-
-/// Capture one full checkpoint through the running sandbox's existing control endpoint.
-///
-/// A published checkpoint may coexist with failed source recovery. Preserve both facts so the
-/// snapshot caller can publish the artifact before reporting a typed partial failure.
-pub(crate) async fn control_checkpoint_create(
-    local: &crate::backend::LocalBackend,
-    name: &str,
-    checkpoint_id: String,
-    record_integrity: bool,
-    guest_flush: microsandbox_types::GuestFlush,
-) -> MicrosandboxResult<CheckpointCaptureOutcome> {
-    let session = local.control_session(name).await?.ok_or_else(|| {
-        MicrosandboxError::Runtime("runtime control endpoint is unavailable".into())
-    })?;
-    let capabilities = session.capabilities();
-    if !capabilities.checkpoint_create {
-        return Err(MicrosandboxError::unsupported(
-            Operation::SnapshotOps,
-            UnsupportedReason::NotAvailable(
-                "this running sandbox does not support full checkpoint capture".into(),
-            ),
-        ));
-    }
-    let request = microsandbox_protocol::control::CheckpointCreate {
-        guest_flush: capture_flush_policy(Some(capabilities), guest_flush, false)?,
-        record_integrity,
-        checkpoint_id,
-        intent: microsandbox_protocol::control::CheckpointCaptureIntent::FullSnapshot,
-    };
-    if !capabilities.optional_disk_integrity {
-        return Err(MicrosandboxError::Runtime(
-            "source runtime lacks optional disk integrity; restart with the matching runtime"
-                .into(),
-        ));
-    }
-    let response = session
-        .request(&CreateCheckpoint(request))
-        .await
-        .map_err(crate::MicrosandboxError::ControlClient)?;
-    checkpoint_response(response)
-}
-
-fn checkpoint_response(
-    response: microsandbox_protocol::control::CheckpointResult,
-) -> MicrosandboxResult<CheckpointCaptureOutcome> {
-    let checkpoint = response.checkpoint.ok_or_else(|| {
-        MicrosandboxError::Runtime("control response omitted checkpoint state".into())
-    })?;
-    Ok(CheckpointCaptureOutcome {
-        checkpoint,
-        recovery_error: response.recovery_error,
-    })
-}
-
-/// Request disk-only capture without falling back to full-state capture or a stopped copy.
-pub(crate) async fn control_disk_checkpoint_create(
-    local: &crate::backend::LocalBackend,
-    name: &str,
-    checkpoint_id: String,
-    guest_flush: microsandbox_types::GuestFlush,
-) -> MicrosandboxResult<microsandbox_runtime::control::DiskCheckpointControlState> {
-    let session = local.control_session(name).await?.ok_or_else(|| {
-        MicrosandboxError::Runtime("runtime control endpoint is unavailable".into())
-    })?;
-    let capabilities = session.capabilities();
-    if !capabilities.disk_checkpoint_create {
-        return Err(MicrosandboxError::unsupported(Operation::SnapshotOps,
-            UnsupportedReason::NotAvailable("this runtime does not support live disk-only snapshots; recreate the sandbox with the updated runtime".into())));
-    }
-    let request = microsandbox_protocol::control::DiskCheckpointCreate {
-        checkpoint_id,
-        guest_flush: capture_flush_policy(Some(capabilities), guest_flush, true)?,
-    };
-    let response = session
-        .request(&CreateDiskCheckpoint(request))
-        .await
-        .map_err(crate::MicrosandboxError::ControlClient)?;
-    Ok(microsandbox_runtime::control::DiskCheckpointControlState {
-        checkpoint_id: response.checkpoint_id,
-        path: response.path,
-        disk: response.disk,
-        owned_volumes: response.owned_volumes,
-    })
-}
-
-/// Never let an older runtime silently discard an explicit policy. Full Auto is the
-/// released behavior and can retain the old request shape; disk Auto is a new guarantee.
-pub(crate) fn capture_flush_policy(
-    capabilities: Option<microsandbox_protocol::control::RuntimeCapabilities>,
-    policy: microsandbox_types::GuestFlush,
-    disk_only: bool,
-) -> MicrosandboxResult<Option<microsandbox_types::GuestFlush>> {
-    if capabilities.is_some_and(|capabilities| capabilities.guest_flush_policy) {
-        return Ok(Some(policy));
-    }
-    if !disk_only && policy == microsandbox_types::GuestFlush::Auto {
-        return Ok(None);
-    }
-    Err(MicrosandboxError::unsupported(Operation::SnapshotOps,
-        UnsupportedReason::NotAvailable("source runtime does not support guest-flush policy; restart the sandbox with an updated runtime".into())))
-}
-
 /// Send the value-bearing live secret batch to the sandbox process. The
 /// request travels only over the private per-sandbox control endpoint and is
 /// never logged; failures surface the runtime's error, which carries secret
@@ -1244,121 +1195,15 @@ fn plan_requires_restart(plan: &SandboxModificationPlan) -> bool {
     })
 }
 
-fn apply_patch_to_config(config: &mut SandboxConfig, patch: &SandboxModificationPatch) {
-    if let Some(cpus) = patch.cpus {
-        config.spec.resources.cpus = cpus;
-    }
-    if let Some(max_cpus) = patch.max_cpus {
-        config.spec.resources.max_cpus = max_cpus;
-    }
-    if config.spec.resources.max_cpus < config.spec.resources.cpus {
-        config.spec.resources.max_cpus = config.spec.resources.cpus;
-    }
-    if let Some(memory_mib) = patch.memory_mib {
-        config.spec.resources.memory_mib = memory_mib;
-    }
-    if let Some(max_memory_mib) = patch.max_memory_mib {
-        config.spec.resources.max_memory_mib = max_memory_mib;
-    }
-    if config.spec.resources.max_memory_mib < config.spec.resources.memory_mib {
-        config.spec.resources.max_memory_mib = config.spec.resources.memory_mib;
-    }
-    if let Some(size_mib) = patch.root_disk_size_mib
-        && let RootfsSource::Oci(oci) = &mut config.spec.image
-    {
-        match &mut oci.root_disk {
-            Some(RootDisk::Managed { size_mib: s })
-            | Some(RootDisk::Tmpfs { size_mib: s })
-            | Some(RootDisk::Flat { size_mib: s, .. }) => {
-                *s = Some(size_mib);
-            }
-            // The planner surfaces disk-image sizing as a conflict; never
-            // touch a user-owned image here.
-            Some(RootDisk::DiskImage { .. }) => {}
-            None => {
-                oci.root_disk = Some(RootDisk::Managed {
-                    size_mib: Some(size_mib),
-                });
-            }
-        }
-    }
-    for var in &patch.env {
-        if let Some(existing) = config
-            .spec
-            .env
-            .iter_mut()
-            .find(|entry| entry.key == var.key)
-        {
-            existing.value = var.value.clone();
-        } else {
-            config.spec.env.push(var.clone());
-        }
-    }
-    config
-        .spec
-        .env
-        .retain(|entry| !patch.env_remove.contains(&entry.key));
-    for (key, value) in &patch.labels {
-        config.spec.labels.insert(key.clone(), value.clone());
-    }
-    for key in &patch.labels_remove {
-        config.spec.labels.remove(key);
-    }
-    if let Some(workdir) = &patch.workdir {
-        config.spec.runtime.workdir = Some(workdir.clone());
-    }
-}
-
-/// Persist secret specs and removals into the sandbox's network secrets
-/// config.
-///
-/// A source-based spec records the host-side reference and drops any
-/// previously inlined raw value; the value is resolved from the source at
-/// spawn time. A value-based spec persists the value into the entry — the
-/// documented at-rest property shared with create's `secret_env` — until a
-/// later source-based rotate migrates the entry to a reference.
-#[cfg(feature = "net")]
-fn apply_secret_patch_to_config(
-    config: &mut SandboxConfig,
-    patch: &SandboxModificationPatch,
-) -> MicrosandboxResult<()> {
-    if patch.secrets.is_empty() && patch.secrets_remove.is_empty() {
-        return Ok(());
-    }
-    let mut network = config.local_network_config()?;
-    for spec in &patch.secrets {
-        apply_secret_spec(&mut network.secrets, spec)?;
-    }
-    network
-        .secrets
-        .secrets
-        .retain(|entry| !patch.secrets_remove.contains(&entry.env_var));
-    // TLS-identity secrets require interception; deliberate plain-HTTP
-    // secrets do not. This is one-way because TLS may have been enabled for
-    // independent reasons.
-    if !network.tls.enabled && network.secrets.has_tls_identity_secrets() {
-        network.tls.enabled = true;
-    }
-    // Enforce env-var and placeholder shape rules before anything persists;
-    // validation errors carry entry indexes and sizes, never values.
-    network.secrets.validate().map_err(|err| {
-        crate::MicrosandboxError::InvalidConfig(format!("invalid secret configuration: {err}"))
-    })?;
-    config.set_local_network_config(network)
-}
-
-#[cfg(not(feature = "net"))]
-fn apply_secret_patch_to_config(
-    _config: &mut SandboxConfig,
-    patch: &SandboxModificationPatch,
-) -> MicrosandboxResult<()> {
-    if patch.secrets.is_empty() && patch.secrets_remove.is_empty() {
-        return Ok(());
-    }
-    Err(crate::MicrosandboxError::unsupported(
-        Operation::SandboxModify,
-        UnsupportedReason::RequiresCrateFeature("net"),
-    ))
+fn has_live_label_change(plan: &SandboxModificationPlan) -> bool {
+    plan.changes.iter().any(|change| {
+        matches!(
+            change,
+            PlannedChange::Config(change)
+                if change.field == LABEL_FIELD
+                    && change.disposition == ModificationDisposition::Live
+        )
+    })
 }
 
 /// Secret material carried by one spec: a raw value or a source reference.
@@ -1583,10 +1428,17 @@ fn resolve_secret_source_value(
     }
 }
 
+/// Save the desired config, its caller overrides, and searchable labels in one transaction.
+///
+/// With `active_labels`, also replace `active_config`, but only while the
+/// sandbox is running or draining and `active_config` still equals
+/// `expected_json`; otherwise the transaction rolls back and returns
+/// [`MicrosandboxError::ControlStateChanged`].
 async fn persist_config(
     backend: &Arc<dyn Backend>,
     handle: &super::SandboxHandle,
     config: &SandboxConfig,
+    active_labels: Option<ActiveLabelsUpdate>,
 ) -> MicrosandboxResult<()> {
     let local = handle
         .local()
@@ -1598,14 +1450,22 @@ async fn persist_config(
     let labels = config.spec.labels.clone();
     let write_db = local_backend.db().await?.write();
     let config_json = serde_json::to_string(config)?;
+    let caller_config_overrides_json = config.caller_config_overrides_json(&config_json)?;
 
     write_db
         .transaction(|txn| {
             let config_json = config_json.clone();
             let labels = labels.clone();
+            let active_labels = active_labels.as_ref();
+            let caller_config_overrides_json = caller_config_overrides_json.clone();
+
             async move {
                 sandbox_entity::Entity::update_many()
                     .col_expr(sandbox_entity::Column::Config, Expr::value(config_json))
+                    .col_expr(
+                        sandbox_entity::Column::CallerConfigOverrides,
+                        Expr::value(caller_config_overrides_json),
+                    )
                     .col_expr(
                         sandbox_entity::Column::UpdatedAt,
                         Expr::value(chrono::Utc::now().naive_utc()),
@@ -1630,12 +1490,40 @@ async fn persist_config(
                     .await?;
                 }
 
+                if let Some(active_labels) = active_labels {
+                    let result = sandbox_entity::Entity::update_many()
+                        .col_expr(
+                            sandbox_entity::Column::ActiveConfig,
+                            Expr::value(active_labels.active_config_json.clone()),
+                        )
+                        .col_expr(
+                            sandbox_entity::Column::UpdatedAt,
+                            Expr::value(chrono::Utc::now().naive_utc()),
+                        )
+                        .filter(sandbox_entity::Column::Id.eq(local.db_id))
+                        .filter(
+                            sandbox_entity::Column::Status
+                                .is_in([SandboxStatus::Running, SandboxStatus::Draining]),
+                        )
+                        .filter(
+                            sandbox_entity::Column::ActiveConfig
+                                .eq(active_labels.expected_json.clone()),
+                        )
+                        .exec(&txn)
+                        .await?;
+                    if result.rows_affected != 1 {
+                        return Err(MicrosandboxError::ControlStateChanged);
+                    }
+                }
+
                 Ok((txn, ()))
             }
         })
         .await
 }
 
+/// Save the running config through its control session and advance the expected JSON.
+/// The session checks that the run and previously observed config still match.
 async fn persist_active_config(
     backend: &Arc<dyn Backend>,
     session: &ControlSession,
@@ -1973,7 +1861,7 @@ fn push_secret_changes(
             )
         };
         let reason = if policy_changed {
-            spec_reason(status, policy, SECRET_POLICY_REQUIRES_RESTART)
+            spec_reason(status, disposition, SECRET_POLICY_REQUIRES_RESTART)
         } else {
             secret_reason(
                 status,
@@ -2176,19 +2064,22 @@ fn push_live_secret_warning(
 
 /// Plan env, label, and workdir changes.
 ///
-/// These fields have no live path yet: they persist for the next start when
-/// the sandbox is stopped (or under the next-start policy) and otherwise
-/// require a restart before future execs or metadata queries observe them.
+/// Labels on a running or draining sandbox with an active configuration are
+/// planned live unless the policy is `next_start`. Env and workdir have no live
+/// path: they persist for the next start when the sandbox is stopped (or under
+/// the next-start policy) and otherwise require a restart.
 fn push_spec_changes(
     status: SandboxStatus,
     config: &SandboxConfig,
+    active: Option<&SandboxConfig>,
     patch: &SandboxModificationPatch,
     policy: ModificationPolicy,
     changes: &mut Vec<PlannedChange>,
     warnings: &mut Vec<ModificationWarning>,
 ) {
-    for var in &patch.env {
-        let existing = config.spec.env.iter().find(|entry| entry.key == var.key);
+    // Entries apply in order, so commands see the last entry for a key.
+    for var in patched_env(patch) {
+        let existing = config.spec.env.iter().rfind(|entry| entry.key == var.key);
         if existing.is_some_and(|entry| entry.value == var.value) {
             continue;
         }
@@ -2205,7 +2096,7 @@ fn push_spec_changes(
     }
 
     for key in &patch.env_remove {
-        let Some(existing) = config.spec.env.iter().find(|entry| entry.key == *key) else {
+        let Some(existing) = config.spec.env.iter().rfind(|entry| entry.key == *key) else {
             continue;
         };
         changes.push(spec_change(
@@ -2220,34 +2111,42 @@ fn push_spec_changes(
         push_future_exec_warning(ENV_FIELD, status, policy, warnings);
     }
 
+    // The active configuration requested labels are also compared against:
+    // present for a running sandbox unless the policy is `next_start`.
+    let reconcile =
+        active.filter(|_| running_status(status) && policy != ModificationPolicy::NextStart);
+
     for (key, value) in &patch.labels {
-        let existing = config.spec.labels.get(key);
-        if existing.is_some_and(|current| current == value) {
+        let saved = config.spec.labels.get(key);
+        let running = reconcile.and_then(|active_config| active_config.spec.labels.get(key));
+        let running_stale = reconcile.is_some() && running != Some(value);
+        if saved == Some(value) && !running_stale {
             continue;
         }
-        changes.push(spec_change(
-            LABEL_FIELD,
+        let existing = if running_stale { running } else { saved };
+        changes.push(label_change(
             change_kind_for(existing.is_some()),
             existing.map(|current| format!("{key}={current}")),
             Some(format!("{key}={value}")),
             status,
             policy,
-            LIVE_LABEL_UPDATE_UNAVAILABLE,
+            active,
         ));
     }
 
     for key in &patch.labels_remove {
-        let Some(current) = config.spec.labels.get(key) else {
+        let saved = config.spec.labels.get(key);
+        let running = reconcile.and_then(|active_config| active_config.spec.labels.get(key));
+        let Some(existing) = running.or(saved) else {
             continue;
         };
-        changes.push(spec_change(
-            LABEL_FIELD,
+        changes.push(label_change(
             ChangeKind::Removed,
-            Some(format!("{key}={current}")),
+            Some(format!("{key}={existing}")),
             None,
             status,
             policy,
-            LIVE_LABEL_UPDATE_UNAVAILABLE,
+            active,
         ));
     }
 
@@ -2268,11 +2167,34 @@ fn push_spec_changes(
     }
 }
 
+/// The env entries `patch` sets, one per key: a key set twice takes its last value.
+fn patched_env(patch: &SandboxModificationPatch) -> impl Iterator<Item = &EnvVar> {
+    patch
+        .env
+        .iter()
+        .enumerate()
+        .filter(|(index, var)| {
+            !patch.env[index + 1..]
+                .iter()
+                .any(|later| later.key == var.key)
+        })
+        .map(|(_, var)| var)
+}
+
 fn push_spec_conflicts(
     patch: &SandboxModificationPatch,
     conflicts: &mut Vec<ModificationConflict>,
 ) {
     for var in &patch.env {
+        // Apply create's env rules to the entries being set; removals stay allowed.
+        if let Err(crate::MicrosandboxError::InvalidConfig(message)) =
+            super::validate_env(std::slice::from_ref(var))
+        {
+            conflicts.push(ModificationConflict {
+                field: ENV_FIELD.to_string(),
+                message,
+            });
+        }
         if patch.env_remove.contains(&var.key) {
             conflicts.push(ModificationConflict {
                 field: ENV_FIELD.to_string(),
@@ -2284,6 +2206,16 @@ fn push_spec_conflicts(
         }
     }
     for (key, _) in &patch.labels {
+        // Same key rules as create. Removal is not checked, so a sandbox that
+        // already holds such a key can be repaired.
+        if let Err(crate::MicrosandboxError::InvalidConfig(message)) =
+            super::validate_labels(&BTreeMap::from([(key.clone(), String::new())]))
+        {
+            conflicts.push(ModificationConflict {
+                field: LABEL_FIELD.to_string(),
+                message,
+            });
+        }
         if patch.labels_remove.contains(key) {
             conflicts.push(ModificationConflict {
                 field: LABEL_FIELD.to_string(),
@@ -2497,14 +2429,62 @@ fn spec_change(
     policy: ModificationPolicy,
     running_reason: &str,
 ) -> PlannedChange {
+    let disposition = spec_disposition(status, policy);
+    config_change(
+        field,
+        change,
+        before,
+        after,
+        disposition,
+        spec_reason(status, disposition, running_reason),
+    )
+}
+
+fn label_change(
+    change: ChangeKind,
+    before: Option<String>,
+    after: Option<String>,
+    status: SandboxStatus,
+    policy: ModificationPolicy,
+    active: Option<&SandboxConfig>,
+) -> PlannedChange {
+    let disposition = label_disposition(status, policy, active);
+    let reason = spec_reason(status, disposition, LIVE_LABEL_UPDATE_NEEDS_ACTIVE_CONFIG);
+    config_change(LABEL_FIELD, change, before, after, disposition, reason)
+}
+
+fn config_change(
+    field: &str,
+    change: ChangeKind,
+    before: Option<String>,
+    after: Option<String>,
+    disposition: ModificationDisposition,
+    reason: Option<String>,
+) -> PlannedChange {
     PlannedChange::Config(ConfigPlannedChange {
         field: field.to_string(),
         change,
         before,
         after,
-        disposition: spec_disposition(status, policy),
-        reason: spec_reason(status, policy, running_reason),
+        disposition,
+        reason,
     })
+}
+
+fn label_disposition(
+    status: SandboxStatus,
+    policy: ModificationPolicy,
+    active: Option<&SandboxConfig>,
+) -> ModificationDisposition {
+    match spec_disposition(status, policy) {
+        ModificationDisposition::RequiresRestart if running_status(status) && active.is_some() => {
+            ModificationDisposition::Live
+        }
+        ModificationDisposition::RequiresRestart => ModificationDisposition::RequiresRestart,
+        ModificationDisposition::Unsupported => ModificationDisposition::Unsupported,
+        ModificationDisposition::Live => ModificationDisposition::Live,
+        ModificationDisposition::NextStart => ModificationDisposition::NextStart,
+    }
 }
 
 fn spec_disposition(status: SandboxStatus, policy: ModificationPolicy) -> ModificationDisposition {
@@ -2519,10 +2499,10 @@ fn spec_disposition(status: SandboxStatus, policy: ModificationPolicy) -> Modifi
 
 fn spec_reason(
     status: SandboxStatus,
-    policy: ModificationPolicy,
+    disposition: ModificationDisposition,
     running_reason: &str,
 ) -> Option<String> {
-    match spec_disposition(status, policy) {
+    match disposition {
         ModificationDisposition::RequiresRestart if running_status(status) => {
             Some(running_reason.to_string())
         }
@@ -2530,7 +2510,9 @@ fn spec_reason(
             "cannot modify while sandbox is {}",
             status_name(status)
         )),
-        _ => None,
+        ModificationDisposition::RequiresRestart
+        | ModificationDisposition::Live
+        | ModificationDisposition::NextStart => None,
     }
 }
 
@@ -2843,11 +2825,22 @@ fn format_mib(mib: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    use microsandbox_runtime::control::control_socket_path_for;
     use sea_orm::ActiveModelTrait;
     use tempfile::tempdir;
+    #[cfg(unix)]
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use super::*;
     use crate::backend::LocalBackend;
+    #[cfg(unix)]
+    use crate::db::entity::run;
+    #[cfg(unix)]
+    use crate::runtime::sandbox_agent_socket_path_candidates_for;
     use crate::size::SizeExt;
 
     #[test]
@@ -2860,20 +2853,22 @@ mod tests {
         };
         for capabilities in [None, Some(old)] {
             assert_eq!(
-                capture_flush_policy(capabilities, Auto, false).unwrap(),
+                ControlSession::capture_flush_policy(capabilities, Auto, false).unwrap(),
                 None
             );
             for policy in [Auto, Required, Skip] {
-                assert!(capture_flush_policy(capabilities, policy, true).is_err());
+                assert!(ControlSession::capture_flush_policy(capabilities, policy, true).is_err());
                 if policy != Auto {
-                    assert!(capture_flush_policy(capabilities, policy, false).is_err());
+                    assert!(
+                        ControlSession::capture_flush_policy(capabilities, policy, false).is_err()
+                    );
                 }
             }
         }
         for disk in [true, false] {
             for policy in [Auto, Required, Skip] {
                 assert_eq!(
-                    capture_flush_policy(Some(new), policy, disk).unwrap(),
+                    ControlSession::capture_flush_policy(Some(new), policy, disk).unwrap(),
                     Some(policy)
                 );
             }
@@ -2892,7 +2887,8 @@ mod tests {
             let mut config = config(cpus, 256);
             config.spec.resources.max_cpus = cpus;
             config.spec.resources.max_memory_mib = 256;
-            restore_requested_resources(&local, &mut config)
+            local
+                .restore_requested_resources(&mut config)
                 .await
                 .unwrap();
             assert_eq!(config.spec.resources.cpus, cpus);
@@ -2954,7 +2950,7 @@ mod tests {
         config.spec.resources.max_cpus = 4;
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            restore_requested_resources(&local, &mut config),
+            local.restore_requested_resources(&mut config),
         )
         .await
         .unwrap()
@@ -3017,7 +3013,7 @@ mod tests {
             config.spec.resources.max_cpus = 4;
             let error = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                restore_requested_resources(&local, &mut config),
+                local.restore_requested_resources(&mut config),
             )
             .await
             .unwrap()
@@ -3089,7 +3085,7 @@ mod tests {
         config.spec.resources.max_memory_mib = 1024;
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            restore_requested_resources(&local, &mut config),
+            local.restore_requested_resources(&mut config),
         )
         .await
         .unwrap()
@@ -3169,10 +3165,13 @@ mod tests {
                 },
             ),
         ] {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                control_disk_compact(local, "worker", target, Some(999), true),
-            )
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                local
+                    .require_control_session("worker")
+                    .await?
+                    .compact_disks(target, Some(999), true)
+                    .await
+            })
             .await
             .unwrap()
             .unwrap();
@@ -3229,24 +3228,28 @@ mod tests {
                 }
             }));
         }
-        let first_capture = control_checkpoint_create(
-            &first,
-            "worker",
-            "first-checkpoint".into(),
-            false,
-            microsandbox_types::GuestFlush::Auto,
-        )
-        .await
-        .unwrap();
-        let second_capture = control_checkpoint_create(
-            &second,
-            "worker",
-            "second-checkpoint".into(),
-            true,
-            microsandbox_types::GuestFlush::Auto,
-        )
-        .await
-        .unwrap();
+        let first_capture = first
+            .require_control_session("worker")
+            .await
+            .unwrap()
+            .create_checkpoint(
+                "first-checkpoint".into(),
+                false,
+                microsandbox_types::GuestFlush::Auto,
+            )
+            .await
+            .unwrap();
+        let second_capture = second
+            .require_control_session("worker")
+            .await
+            .unwrap()
+            .create_checkpoint(
+                "second-checkpoint".into(),
+                true,
+                microsandbox_types::GuestFlush::Auto,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             first_capture.checkpoint.path,
             std::path::Path::new("/capture/first")
@@ -3289,57 +3292,6 @@ mod tests {
         }
     }
 
-    fn checkpoint_reply(ok: bool) -> microsandbox_protocol::control::CheckpointResult {
-        microsandbox_protocol::control::CheckpointResult {
-            checkpoint: Some(microsandbox_protocol::control::CheckpointState {
-                checkpoint_id: "checkpoint_test".into(),
-                checkpoint_root: format!("sha256:{}", "a".repeat(64)),
-                path: "/runtime/checkpoint_test".into(),
-                memory_mode: "full".into(),
-                memory_logical_bytes: 4096,
-                memory_emitted_bytes: 4096,
-            }),
-            recovery_error: (!ok)
-                .then(|| "source recovery failed without a runtime diagnostic".into()),
-        }
-    }
-
-    #[test]
-    fn checkpoint_reply_preserves_publication_and_failed_source_recovery() {
-        for detail in ["resume failed", "thaw timed out; re-pause failed"] {
-            let mut response = checkpoint_reply(false);
-            response.recovery_error = Some(detail.into());
-            let outcome = checkpoint_response(response).unwrap();
-            assert_eq!(outcome.checkpoint.checkpoint_id, "checkpoint_test");
-            assert_eq!(outcome.recovery_error.as_deref(), Some(detail));
-        }
-    }
-
-    #[test]
-    fn checkpoint_reply_preserves_success_without_requesting_another_resume() {
-        // The runtime alone restores the prior execution state. This also covers its successful
-        // capture of an intentionally paused source; the SDK must not initiate another resume.
-        let outcome = checkpoint_response(checkpoint_reply(true)).unwrap();
-        assert!(outcome.recovery_error.is_none());
-    }
-
-    #[test]
-    fn checkpoint_reply_never_invents_a_published_artifact() {
-        for ok in [false, true] {
-            let mut response = checkpoint_reply(ok);
-            response.checkpoint = None;
-            assert!(matches!(
-                checkpoint_response(response),
-                Err(crate::MicrosandboxError::Runtime(_))
-            ));
-        }
-        let outcome = checkpoint_response(checkpoint_reply(false)).unwrap();
-        assert_eq!(
-            outcome.recovery_error.as_deref(),
-            Some("source recovery failed without a runtime diagnostic")
-        );
-    }
-
     fn config(cpus: u8, memory_mib: u32) -> SandboxConfig {
         let mut config = SandboxConfig::default();
         config.spec.name = "api".to_string();
@@ -3380,8 +3332,82 @@ mod tests {
         .unwrap();
     }
 
+    async fn label_backend(home: &std::path::Path) -> (Arc<LocalBackend>, Arc<dyn Backend>) {
+        let builder = crate::test_support::local_backend_builder(home);
+        let local = Arc::new(builder.build().await.unwrap());
+        let backend = local.clone();
+        (local, backend)
+    }
+
+    async fn seed_running_labeled(
+        local: &LocalBackend,
+        saved: &SandboxConfig,
+        active: &SandboxConfig,
+    ) -> i32 {
+        let pools = local.db().await.unwrap();
+        let sandbox_id = sandbox_entity::Entity::insert(sandbox_entity::ActiveModel {
+            name: Set(saved.spec.name.clone()),
+            config: Set(serde_json::to_string(saved).unwrap()),
+            active_config: Set(Some(serde_json::to_string(active).unwrap())),
+            status: Set(SandboxStatus::Running),
+            ephemeral: Set(false),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap()
+        .last_insert_id;
+        if !saved.spec.labels.is_empty() {
+            sandbox_label_entity::Entity::insert_many(saved.spec.labels.iter().map(
+                |(key, value)| sandbox_label_entity::ActiveModel {
+                    sandbox_id: Set(sandbox_id),
+                    key: Set(key.clone()),
+                    value: Set(value.clone()),
+                },
+            ))
+            .exec(pools.write())
+            .await
+            .unwrap();
+        }
+        sandbox_id
+    }
+
+    async fn label_copies(
+        local: &LocalBackend,
+        sandbox_id: i32,
+    ) -> (
+        BTreeMap<String, String>,
+        Option<BTreeMap<String, String>>,
+        Vec<(String, String)>,
+    ) {
+        let pools = local.db().await.unwrap();
+        let row = sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+        let labels = |json: &str| {
+            serde_json::from_str::<SandboxConfig>(json)
+                .unwrap()
+                .spec
+                .labels
+        };
+        let desired = labels(&row.config);
+        let active = row.active_config.as_deref().map(labels);
+        let mut projection = sandbox_label_entity::Entity::find()
+            .filter(sandbox_label_entity::Column::SandboxId.eq(sandbox_id))
+            .all(pools.read())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|label| (label.key, label.value))
+            .collect::<Vec<_>>();
+        projection.sort();
+        (desired, active, projection)
+    }
+
     #[tokio::test]
-    async fn persist_config_replaces_label_projection() {
+    async fn persist_config_replaces_labels_and_preserves_caller_config_overrides() {
         let temp = tempdir().unwrap();
         let backend: Arc<dyn Backend> = Arc::new(
             LocalBackend::builder()
@@ -3394,6 +3420,11 @@ mod tests {
         );
         let pools = backend.as_local().unwrap().db().await.unwrap();
         let mut current = config(2, 1024);
+        current.spec.image = RootfsSource::oci("alpine");
+        let mut options = crate::SandboxConfigPatch::new();
+        options.spec.runtime.workdir = Some(None);
+        options.spec.runtime.cmd = Some(Vec::new());
+        current.caller_config_overrides = Some(Box::new(options));
         current.spec.labels.insert("team".into(), "stale".into());
         current.spec.labels.insert("removed".into(), "ghost".into());
         let model = sandbox_entity::ActiveModel {
@@ -3422,16 +3453,24 @@ mod tests {
         }
 
         let mut updated = current;
-        updated.spec.labels.remove("removed");
-        updated.spec.labels.insert("team".into(), "metrics".into());
-        updated.spec.labels.insert("tier".into(), "gold".into());
+        updated.apply_modification(&SandboxModificationPatch {
+            labels: [
+                ("team".into(), "metrics".into()),
+                ("tier".into(), "gold".into()),
+            ]
+            .into(),
+            labels_remove: vec!["removed".into()],
+            ..Default::default()
+        });
         let handle = backend
             .sandboxes()
             .get(backend.clone(), &updated.spec.name)
             .await
             .unwrap();
 
-        persist_config(&backend, &handle, &updated).await.unwrap();
+        persist_config(&backend, &handle, &updated, None)
+            .await
+            .unwrap();
 
         let mut rows = sandbox_label_entity::Entity::find()
             .filter(sandbox_label_entity::Column::SandboxId.eq(sandbox_id))
@@ -3453,12 +3492,36 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let stored: SandboxConfig = serde_json::from_str(&stored.config).unwrap();
+        let stored =
+            SandboxConfig::from_stored(&stored.config, stored.caller_config_overrides.as_deref())
+                .unwrap();
         assert_eq!(stored.spec.labels, updated.spec.labels);
+
+        // Reload through the real handle boundary before rebuilding with new defaults.
+        let reloaded = backend
+            .sandboxes()
+            .get(backend.clone(), &updated.spec.name)
+            .await
+            .unwrap();
+        let reloaded = reloaded.config().unwrap();
+        let intent = reloaded.caller_config_overrides.as_ref().unwrap();
+        assert_eq!(intent.spec.runtime.workdir, Some(None));
+        assert_eq!(intent.spec.runtime.cmd, Some(Vec::new()));
+        assert!(intent.spec.resources.cpus.is_none());
+        assert!(intent.spec.init.is_none());
+        let defaults = crate::config::layers::BackendConfig::new(
+            serde_json::from_str(r#"{"sandbox_defaults":{"workdir":"/new-default"}}"#).unwrap(),
+            Default::default(),
+        );
+        let rebuilt = crate::sandbox::SandboxBuilder::from(reloaded)
+            .finish(Some(&defaults), None)
+            .unwrap();
+        assert_eq!(rebuilt.spec.runtime.workdir, None);
+        assert_eq!(rebuilt.spec.runtime.cmd, Some(Vec::new()));
 
         let mut without_labels = updated;
         without_labels.spec.labels.clear();
-        persist_config(&backend, &handle, &without_labels)
+        persist_config(&backend, &handle, &without_labels, None)
             .await
             .unwrap();
 
@@ -3475,6 +3538,80 @@ mod tests {
             .unwrap();
         let stored: SandboxConfig = serde_json::from_str(&stored.config).unwrap();
         assert!(stored.spec.labels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_rejects_invalid_env_and_saves_nothing() {
+        let temp = tempdir().unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(
+            LocalBackend::builder()
+                .config_path(temp.path().join("config.json"))
+                .managed_config_path(temp.path().join("managed.json"))
+                .home(temp.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let pools = backend.as_local().unwrap().db().await.unwrap();
+        let mut current = config(2, 1024);
+        current.spec.env = vec![EnvVar::new("MODE", "dev"), EnvVar::new("MSB_LEGACY", "1")];
+        let stored_before = serde_json::to_string(&current).unwrap();
+        let model = sandbox_entity::ActiveModel {
+            name: Set(current.spec.name.clone()),
+            config: Set(stored_before.clone()),
+            active_config: Set(None),
+            status: Set(SandboxStatus::Stopped),
+            ephemeral: Set(false),
+            ..Default::default()
+        }
+        .insert(pools.write())
+        .await
+        .unwrap();
+        let stored_config = || async {
+            sandbox_entity::Entity::find_by_id(model.id)
+                .one(pools.read())
+                .await
+                .unwrap()
+                .unwrap()
+                .config
+        };
+
+        let plan = SandboxModificationBuilder::new(backend.clone(), "api")
+            .env("MSB_X", "1")
+            .env("OK", "1")
+            .dry_run()
+            .await
+            .unwrap();
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].field, ENV_FIELD);
+        assert!(plan.conflicts[0].message.contains("reserved MSB_ prefix"));
+
+        let error = SandboxModificationBuilder::new(backend.clone(), "api")
+            .env("MSB_X", "1")
+            .env("OK", "1")
+            .apply()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reserved MSB_ prefix"));
+        assert_eq!(stored_config().await, stored_before);
+
+        let plan = SandboxModificationBuilder::new(backend.clone(), "api")
+            .env("A=B", "1")
+            .dry_run()
+            .await
+            .unwrap();
+        assert_eq!(plan.conflicts.len(), 1);
+        assert!(plan.conflicts[0].message.contains("must not contain '='"));
+
+        // Removing a reserved key that older state already holds stays allowed.
+        let plan = SandboxModificationBuilder::new(backend.clone(), "api")
+            .remove_env("MSB_LEGACY")
+            .apply()
+            .await
+            .unwrap();
+        assert!(plan.applied);
+        let saved: SandboxConfig = serde_json::from_str(&stored_config().await).unwrap();
+        assert_eq!(saved.spec.env, vec![EnvVar::new("MODE", "dev")]);
     }
 
     #[test]
@@ -3553,6 +3690,234 @@ mod tests {
         assert!(change.reason.is_none());
         assert!(validate_apply_supported(&plan).is_ok());
         assert_eq!(live_cpu_target(&plan, &patch), Some(4));
+    }
+
+    #[tokio::test]
+    async fn label_guard_rolls_back_all_copies() {
+        for (name, active_changed) in [("active config changed", true), ("sandbox stopped", false)]
+        {
+            let temp = tempdir().unwrap();
+            let (local, backend) = label_backend(temp.path()).await;
+            let mut current = config(2, 1024);
+            current.spec.labels.insert("team".into(), "old".into());
+            let sandbox_id = seed_running_labeled(&local, &current, &current).await;
+            let pools = local.db().await.unwrap();
+            let current_json = serde_json::to_string(&current).unwrap();
+            let (active_json, status) = if active_changed {
+                let mut changed = current.clone();
+                changed
+                    .spec
+                    .labels
+                    .insert("team".into(), "concurrent".into());
+                (
+                    serde_json::to_string(&changed).unwrap(),
+                    SandboxStatus::Running,
+                )
+            } else {
+                (current_json.clone(), SandboxStatus::Stopped)
+            };
+            sandbox_entity::Entity::update_many()
+                .col_expr(
+                    sandbox_entity::Column::ActiveConfig,
+                    Expr::value(active_json),
+                )
+                .col_expr(sandbox_entity::Column::Status, Expr::value(status))
+                .filter(sandbox_entity::Column::Id.eq(sandbox_id))
+                .exec(pools.write())
+                .await
+                .unwrap();
+            let before = label_copies(&local, sandbox_id).await;
+            let handle = backend
+                .sandboxes()
+                .get(backend.clone(), &current.spec.name)
+                .await
+                .unwrap();
+            let mut updated = current.clone();
+            updated.spec.labels.insert("team".into(), "new".into());
+
+            let error = persist_config(
+                &backend,
+                &handle,
+                &updated,
+                Some(ActiveLabelsUpdate {
+                    expected_json: current_json,
+                    active_config_json: serde_json::to_string(&updated).unwrap(),
+                }),
+            )
+            .await
+            .expect_err("label guard accepted stale state");
+
+            assert!(
+                matches!(&error, MicrosandboxError::ControlStateChanged),
+                "{name}: unexpected error: {error}"
+            );
+            assert_eq!(label_copies(&local, sandbox_id).await, before, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn label_only_apply_is_live_under_default_and_restart_policies() {
+        let temp = tempdir().unwrap();
+        let (local, backend) = label_backend(temp.path()).await;
+
+        for (name, restart, diverged) in [
+            ("default-saved-and-active-diverged", false, true),
+            ("restart-in-sync", true, false),
+        ] {
+            let mut current = config(2, 1024);
+            current.spec.name = name.into();
+            let saved_team = if diverged { "new" } else { "old" };
+            current.spec.labels.insert("team".into(), saved_team.into());
+            if !diverged {
+                current.spec.labels.insert("stale".into(), "remove".into());
+            }
+            let mut active = current.clone();
+            active.spec.labels.insert("team".into(), "old".into());
+            if diverged {
+                active.spec.labels.insert("stale".into(), "remove".into());
+            }
+            let sandbox_id = seed_running_labeled(&local, &current, &active).await;
+            let modify = SandboxModificationBuilder::new(backend.clone(), name)
+                .label("team", "new")
+                .label("tier", "web")
+                .remove_label("stale");
+
+            let plan = if restart { modify.restart() } else { modify }
+                .apply()
+                .await
+                .unwrap();
+            assert!(plan.applied, "{name}");
+            assert!(
+                plan.changes.iter().all(|change| matches!(
+                    change,
+                    PlannedChange::Config(change)
+                        if change.disposition == ModificationDisposition::Live
+                )),
+                "{name}"
+            );
+            let expected = BTreeMap::from([
+                ("team".to_string(), "new".to_string()),
+                ("tier".to_string(), "web".to_string()),
+            ]);
+            let (desired, active, projection) = label_copies(&local, sandbox_id).await;
+            assert_eq!(desired, expected, "{name}");
+            assert_eq!(active.as_ref(), Some(&expected), "{name}");
+            assert_eq!(
+                projection,
+                expected.into_iter().collect::<Vec<_>>(),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_cpu_then_label_apply_uses_the_refreshed_active_snapshot() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let (local, backend) = label_backend(temp.path()).await;
+        let mut current = config(1, 1024);
+        current.spec.name = "cpu-label-live".into();
+        current.spec.resources.max_cpus = 4;
+        current.spec.labels.insert("team".into(), "old".into());
+        let sandbox_id = seed_running_labeled(&local, &current, &current).await;
+        run::ActiveModel {
+            sandbox_id: Set(sandbox_id),
+            pid: Set(Some(std::process::id() as i32)),
+            status: Set(run::RunStatus::Running),
+            ..Default::default()
+        }
+        .insert(local.db().await.unwrap().write())
+        .await
+        .unwrap();
+        let agent = sandbox_agent_socket_path_candidates_for(&local, &current.spec.name).remove(0);
+        let path = control_socket_path_for(&agent);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let server = tokio::spawn(async move {
+            for (op, reply) in [
+                (
+                    "capabilities",
+                    "{\"ok\":true,\"capabilities\":{\"cpu_resize\":true,\"memory_resize\":true,\"secrets_update\":false}}",
+                ),
+                (
+                    "pause_state",
+                    "{\"ok\":true,\"pause\":{\"paused\":false,\"recovery_required\":false}}",
+                ),
+                (
+                    "cpu_target",
+                    "{\"ok\":true,\"cpu\":{\"possible\":4,\"requested_online\":2,\"actual_online\":2,\"enforced\":2}}",
+                ),
+            ] {
+                let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&line).unwrap()["op"],
+                    op
+                );
+                stream
+                    .get_mut()
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let (apply_result, server_result) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                SandboxModificationBuilder::new(backend, &current.spec.name)
+                    .cpus(2)
+                    .label("team", "new")
+                    .apply(),
+                server
+            )
+        })
+        .await
+        .expect("live modify and fake control peer timed out");
+        server_result.expect("fake control peer task panicked");
+        apply_result.expect("live CPU and label modification failed");
+        let row = sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(local.db().await.unwrap().read())
+            .await
+            .unwrap()
+            .unwrap();
+        let active: SandboxConfig = serde_json::from_str(&row.active_config.unwrap()).unwrap();
+        assert_eq!(active.spec.resources.cpus, 2);
+        let expected = BTreeMap::from([("team".to_string(), "new".to_string())]);
+        let (desired, active, projection) = label_copies(&local, sandbox_id).await;
+        assert_eq!(desired, expected);
+        assert_eq!(active.as_ref(), Some(&expected));
+        assert_eq!(projection, expected.into_iter().collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn running_next_start_label_apply_leaves_active_config_unchanged() {
+        let temp = tempdir().unwrap();
+        let (local, backend) = label_backend(temp.path()).await;
+        let mut current = config(2, 1024);
+        current.spec.labels.insert("team".into(), "old".into());
+        let sandbox_id = seed_running_labeled(&local, &current, &current).await;
+
+        let plan = SandboxModificationBuilder::new(backend, &current.spec.name)
+            .label("team", "queued")
+            .next_start()
+            .apply()
+            .await
+            .unwrap();
+
+        let PlannedChange::Config(change) = &plan.changes[0] else {
+            panic!("expected config change");
+        };
+        assert_eq!(change.disposition, ModificationDisposition::NextStart);
+        let expected = BTreeMap::from([("team".to_string(), "queued".to_string())]);
+        let (desired, active, projection) = label_copies(&local, sandbox_id).await;
+        assert_eq!(desired, expected);
+        assert_eq!(active.as_ref(), Some(&current.spec.labels));
+        assert_eq!(projection, expected.into_iter().collect::<Vec<_>>());
     }
 
     #[test]
@@ -3819,18 +4184,59 @@ mod tests {
     #[test]
     fn applying_effective_resource_change_raises_capacity_when_needed() {
         let mut config = config(2, 1024);
+        config.spec.image = RootfsSource::oci("alpine");
+        let mut options = crate::SandboxConfigPatch::new();
+        options.spec.resources.max_cpus = Some(2);
+        options.spec.resources.max_memory_mib = Some(1024);
+        config.caller_config_overrides = Some(Box::new(options));
         let patch = SandboxModificationPatch {
             cpus: Some(4),
             memory_mib: Some(4096),
             ..SandboxModificationPatch::default()
         };
 
-        apply_patch_to_config(&mut config, &patch);
+        config.apply_modification(&patch);
 
         assert_eq!(config.spec.resources.cpus, 4);
         assert_eq!(config.spec.resources.max_cpus, 4);
         assert_eq!(config.spec.resources.memory_mib, 4096);
         assert_eq!(config.spec.resources.max_memory_mib, 4096);
+
+        // A previous explicit capacity must not reappear after modify raises it.
+        let resolved = serde_json::to_string(&config).unwrap();
+        let stored = config
+            .caller_config_overrides_json(&resolved)
+            .unwrap()
+            .unwrap();
+        let config = SandboxConfig::from_stored(&resolved, Some(&stored)).unwrap();
+        let rebuilt = crate::sandbox::SandboxBuilder::from(config)
+            .finish(None, None)
+            .unwrap();
+        assert_eq!(rebuilt.spec.resources.max_cpus, 4);
+        assert_eq!(rebuilt.spec.resources.max_memory_mib, 4096);
+    }
+
+    #[test]
+    fn resize_preserves_effective_capacity_when_saved_overrides_differ() {
+        let mut config = config(2, 1024);
+        config.spec.resources.max_cpus = 8;
+        config.spec.resources.max_memory_mib = 8192;
+        let mut saved = crate::SandboxConfigPatch::new();
+        saved.spec.resources.max_cpus = Some(2);
+        saved.spec.resources.max_memory_mib = Some(1024);
+        config.caller_config_overrides = Some(Box::new(saved));
+
+        config.apply_modification(&SandboxModificationPatch {
+            cpus: Some(4),
+            memory_mib: Some(4096),
+            ..Default::default()
+        });
+
+        assert_eq!(config.spec.resources.max_cpus, 8);
+        assert_eq!(config.spec.resources.max_memory_mib, 8192);
+        let saved = config.caller_config_overrides.unwrap();
+        assert_eq!(saved.spec.resources.max_cpus, Some(8));
+        assert_eq!(saved.spec.resources.max_memory_mib, Some(8192));
     }
 
     fn oci_config_with_upper(upper_mib: u32) -> SandboxConfig {
@@ -4154,7 +4560,7 @@ mod tests {
             ..SandboxModificationPatch::default()
         };
 
-        apply_patch_to_config(&mut config, &patch);
+        config.apply_modification(&patch);
 
         assert_eq!(
             config.spec.image.oci_root_disk(),
@@ -4251,19 +4657,20 @@ mod tests {
     }
 
     #[test]
-    fn running_env_label_workdir_changes_require_restart() {
+    fn running_env_and_workdir_require_restart_while_labels_are_live() {
         let patch = SandboxModificationPatch {
             env: vec![EnvVar::new("MODE", "prod")],
             labels: vec![("team".to_string(), "infra".to_string())],
             workdir: Some("/srv".to_string()),
             ..SandboxModificationPatch::default()
         };
+        let current = config(2, 1024);
 
         let plan = build_plan(
             "api".to_string(),
             SandboxStatus::Running,
-            &config(2, 1024),
-            None,
+            &current,
+            Some(&current),
             LiveControl::default(),
             patch,
             ModificationPolicy::NoRestart,
@@ -4274,23 +4681,181 @@ mod tests {
             let PlannedChange::Config(change) = change else {
                 panic!("expected config change");
             };
-            assert_eq!(change.disposition, ModificationDisposition::RequiresRestart);
             assert_eq!(change.change, ChangeKind::Added);
             match change.field.as_str() {
                 "env" | "workdir" => {
+                    assert_eq!(change.disposition, ModificationDisposition::RequiresRestart);
                     assert_eq!(
                         change.reason.as_deref(),
                         Some(LIVE_EXEC_DEFAULT_UPDATE_UNAVAILABLE)
                     );
                 }
                 "label" => {
-                    assert_eq!(
-                        change.reason.as_deref(),
-                        Some(LIVE_LABEL_UPDATE_UNAVAILABLE)
-                    );
+                    assert_eq!(change.disposition, ModificationDisposition::Live);
+                    assert!(change.reason.is_none());
                 }
                 field => panic!("unexpected field {field}"),
             }
+        }
+    }
+
+    #[test]
+    fn label_dispositions_by_status_policy_and_snapshot() {
+        let mut current = config(2, 1024);
+        current.spec.labels.insert("team".into(), "old".into());
+        let patch = SandboxModificationPatch {
+            labels: vec![("team".into(), "new".into())],
+            ..Default::default()
+        };
+        let running = SandboxStatus::Running;
+        let draining = SandboxStatus::Draining;
+        let default = ModificationPolicy::NoRestart;
+        let restart = ModificationPolicy::Restart;
+        let live = ModificationDisposition::Live;
+        let requires_restart = ModificationDisposition::RequiresRestart;
+        let next_start = ModificationDisposition::NextStart;
+        let unsupported = ModificationDisposition::Unsupported;
+        #[rustfmt::skip]
+        let cases = [
+            ("running default",     running,                 default,                       true,  live,             None,                                              true),
+            ("running restart",     running,                 restart,                       true,  live,             None,                                              true),
+            ("draining default",    draining,                default,                       true,  live,             None,                                              true),
+            ("draining restart",    draining,                restart,                       true,  live,             None,                                              true),
+            ("running no snapshot", running,                 default,                       false, requires_restart, Some(LIVE_LABEL_UPDATE_NEEDS_ACTIVE_CONFIG),      false),
+            ("no snapshot restart", running,                 restart,                       false, requires_restart, Some(LIVE_LABEL_UPDATE_NEEDS_ACTIVE_CONFIG),      true),
+            ("next start",          running,                 ModificationPolicy::NextStart, true,  next_start,       None,                                              true),
+            ("starting",            SandboxStatus::Starting, default,                       true,  unsupported,      Some("cannot modify while sandbox is starting"), false),
+            ("paused",              SandboxStatus::Paused,   default,                       true,  unsupported,      Some("cannot modify while sandbox is paused"),   false),
+        ];
+
+        for (name, status, policy, has_active, disposition, reason, apply_ok) in cases {
+            let plan = build_plan(
+                "api".into(),
+                status,
+                &current,
+                has_active.then_some(&current),
+                LiveControl::default(),
+                patch.clone(),
+                policy,
+            );
+
+            let PlannedChange::Config(change) = &plan.changes[0] else {
+                panic!("{name}: expected config change");
+            };
+            assert_eq!(change.disposition, disposition, "{name}");
+            assert_eq!(change.reason.as_deref(), reason, "{name}");
+            assert_eq!(validate_apply_supported(&plan).is_ok(), apply_ok, "{name}");
+        }
+    }
+
+    #[test]
+    fn label_plan_reconciles_saved_and_active() {
+        #[rustfmt::skip]
+        let cases = [
+            ("set saved only",                    false, (Some("saved"), None),           Some(ChangeKind::Added),   None),
+            ("set active only",                   false, (None, Some("old")),             Some(ChangeKind::Updated), Some("key=old")),
+            ("set both differing",                false, (Some("saved"), Some("old")),    Some(ChangeKind::Updated), Some("key=old")),
+            ("set saved matches, active differs", false, (Some("x"), Some("old")),        Some(ChangeKind::Updated), Some("key=old")),
+            ("set active matches, saved differs", false, (Some("saved"), Some("x")),      Some(ChangeKind::Updated), Some("key=saved")),
+            ("set both equal",                    false, (Some("x"), Some("x")),          None,                      None),
+            ("remove saved only",                 true,  (Some("saved"), None),           Some(ChangeKind::Removed), Some("key=saved")),
+            ("remove active only",                true,  (None, Some("active")),          Some(ChangeKind::Removed), Some("key=active")),
+            ("remove both differing",             true,  (Some("saved"), Some("active")), Some(ChangeKind::Removed), Some("key=active")),
+            ("remove both absent",                true,  (None, None),                    None,                      None),
+        ];
+        for (name, remove, (saved, active), kind, before) in cases {
+            let mut desired = config(2, 1024);
+            if let Some(value) = saved {
+                desired.spec.labels.insert("key".into(), value.into());
+            }
+            let mut active_config = config(2, 1024);
+            if let Some(value) = active {
+                active_config.spec.labels.insert("key".into(), value.into());
+            }
+            let mut patch = SandboxModificationPatch::default();
+            if remove {
+                patch.labels_remove.push("key".into());
+            } else {
+                patch.labels.push(("key".into(), "x".into()));
+            }
+
+            let plan = build_plan(
+                "api".into(),
+                SandboxStatus::Running,
+                &desired,
+                Some(&active_config),
+                LiveControl::default(),
+                patch,
+                ModificationPolicy::NoRestart,
+            );
+
+            let Some(kind) = kind else {
+                assert!(plan.changes.is_empty(), "{name}");
+                continue;
+            };
+            let [PlannedChange::Config(change)] = plan.changes.as_slice() else {
+                panic!("{name}: expected one config change");
+            };
+            assert_eq!(change.change, kind, "{name}");
+            assert_eq!(change.before.as_deref(), before, "{name}");
+            let after = (!remove).then_some("key=x");
+            assert_eq!(change.after.as_deref(), after, "{name}");
+        }
+    }
+
+    #[test]
+    fn mixed_label_and_env_changes_follow_patch_policy() {
+        let current = config(2, 1024);
+        let patch = SandboxModificationPatch {
+            env: vec![EnvVar::new("MODE", "prod")],
+            labels: vec![("team".into(), "new".into())],
+            ..Default::default()
+        };
+
+        for (policy, env, label, apply_allowed, restart) in [
+            (
+                ModificationPolicy::NoRestart,
+                ModificationDisposition::RequiresRestart,
+                ModificationDisposition::Live,
+                false,
+                true,
+            ),
+            (
+                ModificationPolicy::Restart,
+                ModificationDisposition::RequiresRestart,
+                ModificationDisposition::Live,
+                true,
+                true,
+            ),
+            (
+                ModificationPolicy::NextStart,
+                ModificationDisposition::NextStart,
+                ModificationDisposition::NextStart,
+                true,
+                false,
+            ),
+        ] {
+            let plan = build_plan(
+                "api".into(),
+                SandboxStatus::Running,
+                &current,
+                Some(&current),
+                LiveControl::default(),
+                patch.clone(),
+                policy,
+            );
+            let dispositions = plan
+                .changes
+                .iter()
+                .map(|change| match change {
+                    PlannedChange::Config(change) => (change.field.as_str(), change.disposition),
+                    PlannedChange::Secret(_) => panic!("expected config change"),
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(dispositions, vec![(ENV_FIELD, env), (LABEL_FIELD, label)]);
+            assert_eq!(validate_apply_supported(&plan).is_ok(), apply_allowed);
+            assert_eq!(plan_requires_restart(&plan), restart);
         }
     }
 
@@ -4479,7 +5044,7 @@ mod tests {
             ..SandboxModificationPatch::default()
         };
 
-        apply_patch_to_config(&mut current, &patch);
+        current.apply_modification(&patch);
 
         assert_eq!(
             current.spec.env,
@@ -4491,6 +5056,106 @@ mod tests {
         );
         assert!(!current.spec.labels.contains_key("team"));
         assert_eq!(current.spec.runtime.workdir.as_deref(), Some("/srv"));
+    }
+
+    #[test]
+    fn a_repeated_env_key_plans_once_against_its_last_entry() {
+        // Commands see the last entry for a key.
+        let mut current = config(2, 1024);
+        current.spec.env = vec![
+            EnvVar::new("KEY", "a"),
+            EnvVar::new("OTHER", "1"),
+            EnvVar::new("KEY", "b"),
+        ];
+        let rows = |patch: SandboxModificationPatch| -> Vec<(Option<String>, Option<String>)> {
+            build_plan(
+                "api".to_string(),
+                SandboxStatus::Stopped,
+                &current,
+                None,
+                LiveControl::default(),
+                patch,
+                ModificationPolicy::NoRestart,
+            )
+            .changes
+            .into_iter()
+            .map(|change| {
+                let PlannedChange::Config(change) = change else {
+                    panic!("expected config change");
+                };
+                (change.before, change.after)
+            })
+            .collect()
+        };
+        let set = |env: Vec<EnvVar>| SandboxModificationPatch {
+            env,
+            ..SandboxModificationPatch::default()
+        };
+        let row = |before: &str, after: Option<&str>| {
+            (Some(before.to_string()), after.map(str::to_string))
+        };
+
+        assert_eq!(
+            rows(set(vec![EnvVar::new("KEY", "v")])),
+            vec![row("KEY=b", Some("KEY=v"))]
+        );
+        assert_eq!(
+            rows(set(vec![EnvVar::new("KEY", "a")])),
+            vec![row("KEY=b", Some("KEY=a"))]
+        );
+        assert_eq!(
+            rows(set(vec![EnvVar::new("KEY", "x"), EnvVar::new("KEY", "y")])),
+            vec![row("KEY=b", Some("KEY=y"))]
+        );
+        assert!(rows(set(vec![EnvVar::new("KEY", "x"), EnvVar::new("KEY", "b")])).is_empty());
+        assert_eq!(
+            rows(SandboxModificationPatch {
+                env_remove: vec!["KEY".to_string()],
+                ..SandboxModificationPatch::default()
+            }),
+            vec![row("KEY=b", None)]
+        );
+    }
+
+    #[test]
+    fn applying_a_repeated_env_key_keeps_one_entry_with_the_new_value() {
+        let mut current = config(2, 1024);
+        current.spec.env = vec![
+            EnvVar::new("KEY", "a"),
+            EnvVar::new("OTHER", "1"),
+            EnvVar::new("KEY", "b"),
+            EnvVar::new("LAST", "1"),
+        ];
+        let patch = SandboxModificationPatch {
+            env: vec![EnvVar::new("KEY", "x"), EnvVar::new("KEY", "y")],
+            ..SandboxModificationPatch::default()
+        };
+
+        let mut changed = current.clone();
+        changed.apply_modification(&patch);
+        assert_eq!(
+            changed.spec.env,
+            vec![
+                EnvVar::new("OTHER", "1"),
+                EnvVar::new("KEY", "y"),
+                EnvVar::new("LAST", "1"),
+            ]
+        );
+
+        // A key already at its value plans no change, so apply leaves its entries.
+        for env in [
+            vec![EnvVar::new("KEY", "b")],
+            vec![EnvVar::new("KEY", "x"), EnvVar::new("KEY", "b")],
+        ] {
+            let mut unchanged = current.clone();
+            let patch = SandboxModificationPatch {
+                env,
+                labels: vec![("team".to_string(), "infra".to_string())],
+                ..SandboxModificationPatch::default()
+            };
+            unchanged.apply_modification(&patch);
+            assert_eq!(unchanged.spec.env, current.spec.env);
+        }
     }
 
     #[test]
@@ -4519,6 +5184,78 @@ mod tests {
         assert_eq!(plan.conflicts[1].field, "label");
         assert!(plan.conflicts[1].message.contains("team"));
         assert!(validate_apply_supported(&plan).is_err());
+    }
+
+    #[tokio::test]
+    async fn setting_an_invalid_label_key_is_refused_and_nothing_is_saved() {
+        let temp = tempdir().unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(
+            LocalBackend::builder()
+                .config_path(temp.path().join("config.json"))
+                .managed_config_path(temp.path().join("managed.json"))
+                .home(temp.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let pools = backend.as_local().unwrap().db().await.unwrap();
+        // `sandbox.legacy` stands in for a key saved before modify checked keys.
+        let mut current = config(2, 1024);
+        current.spec.labels.insert("team".into(), "infra".into());
+        current
+            .spec
+            .labels
+            .insert("sandbox.legacy".into(), "old".into());
+        let stored_json = serde_json::to_string(&current).unwrap();
+        let model = sandbox_entity::ActiveModel {
+            name: Set(current.spec.name.clone()),
+            config: Set(stored_json.clone()),
+            active_config: Set(None),
+            status: Set(SandboxStatus::Stopped),
+            ephemeral: Set(false),
+            ..Default::default()
+        }
+        .insert(pools.write())
+        .await
+        .unwrap();
+        let stored_config = || async {
+            sandbox_entity::Entity::find_by_id(model.id)
+                .one(pools.read())
+                .await
+                .unwrap()
+                .unwrap()
+                .config
+        };
+
+        for key in ["", "sandbox.id"] {
+            let plan = SandboxModificationBuilder::new(backend.clone(), "api")
+                .label(key, "x")
+                .dry_run()
+                .await
+                .unwrap();
+            assert_eq!(plan.conflicts.len(), 1, "key {key:?}");
+            assert_eq!(plan.conflicts[0].field, LABEL_FIELD);
+
+            let error = SandboxModificationBuilder::new(backend.clone(), "api")
+                .label(key, "x")
+                .apply()
+                .await
+                .expect_err(&format!("key {key:?} was applied"));
+            assert!(error.to_string().contains("label key"), "{error}");
+            assert_eq!(stored_config().await, stored_json);
+        }
+
+        let plan = SandboxModificationBuilder::new(backend.clone(), "api")
+            .remove_label("sandbox.legacy")
+            .apply()
+            .await
+            .unwrap();
+        assert!(plan.applied);
+        let saved: SandboxConfig = serde_json::from_str(&stored_config().await).unwrap();
+        assert_eq!(
+            saved.spec.labels.into_iter().collect::<Vec<_>>(),
+            vec![("team".to_string(), "infra".to_string())]
+        );
     }
 
     #[test]
@@ -4800,7 +5537,7 @@ mod tests {
         for spec in secret_policy_specs() {
             let patch = patch_with_specs(vec![spec]);
             let mut desired = original.clone();
-            apply_secret_patch_to_config(&mut desired, &patch).unwrap();
+            desired.update_secrets(&patch).unwrap();
             let plan = build_plan(
                 "api".into(),
                 SandboxStatus::Running,
@@ -4940,6 +5677,135 @@ mod tests {
                 .unwrap();
             assert!(repeat.changes.is_empty());
         }
+    }
+
+    /// A restart-backed modification must refuse a prospective configuration the
+    /// selected runtime cannot launch before stopping the VM. Regression: the
+    /// capability check used to run only in the start that followed `stop`, which
+    /// left the workload down with the rejected change persisted.
+    #[cfg(all(unix, feature = "net"))]
+    #[tokio::test]
+    async fn restart_preflight_leaves_a_running_sandbox_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::config::{GlobalConfig, PathsConfig};
+
+        // Keep the home path short: the restart sequence derives Unix socket paths
+        // from it, and a long macOS temporary directory can exceed the socket limit.
+        let temp = tempfile::Builder::new()
+            .prefix("msb-restart-preflight-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // A `#!` wrapper has no embedded version metadata, so it resolves as a
+        // legacy launch contract and the pre-stop validation refuses the proxy at
+        // the legacy network gate. The auth-specific capability gate needs a real
+        // executable that also answers the capability probe, which a unit test
+        // cannot fake; `http_connect_credentials_require_runtime_support_before_launch`
+        // covers that gate, and this test covers where the gate runs.
+        let msb = temp.path().join("msb");
+        std::fs::write(
+            &msb,
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             --version) printf 'msb 0.6.18\\n' ;;\n\
+             __launch-protocol) printf '%s' '{\"protocols\":[2,1],\"http_connect_proxy\":true}' ;;\n\
+             *) exit 1 ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&msb, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let library = temp
+            .path()
+            .join(microsandbox_utils::libkrunfw_filename(std::env::consts::OS));
+        std::fs::write(&library, b"").unwrap();
+
+        let backend: Arc<dyn Backend> =
+            Arc::new(crate::test_support::local_backend(GlobalConfig {
+                home: Some(home),
+                paths: PathsConfig {
+                    msb: Some(msb),
+                    libkrunfw: Some(library),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+
+        let mut config = config(2, 1024);
+        config.spec.name = "restart-preflight".to_string();
+        let mut network = config.local_network_config().unwrap();
+        network.outbound_proxy = Some(
+            serde_json::from_value(serde_json::json!({
+                "protocol": "http_connect",
+                "address": "127.0.0.1:3128",
+                "credentials": {
+                    "username": "proxy-user",
+                    "password": {"kind": "env", "var": "HTTP_CONNECT_PASSWORD"}
+                }
+            }))
+            .unwrap(),
+        );
+        config.set_local_network_config(network).unwrap();
+
+        // The row has no recorded runtime, so `stop` converges the stale `Running`
+        // status instead of failing. That keeps the pre-fix ordering observable: the
+        // stop, the persisted change, and the failed start all happen for real.
+        let local = backend.as_local().unwrap();
+        let db = local.db().await.unwrap();
+        let row = sandbox_entity::ActiveModel {
+            name: Set(config.spec.name.clone()),
+            config: Set(serde_json::to_string(&config).unwrap()),
+            active_config: Set(None),
+            status: Set(SandboxStatus::Running),
+            ephemeral: Set(false),
+            ..Default::default()
+        }
+        .insert(db.write())
+        .await
+        .unwrap();
+
+        let result = SandboxModificationBuilder::new(backend.clone(), &config.spec.name)
+            .workdir("/srv")
+            .restart()
+            .apply()
+            .await;
+
+        // The workload and the durable configuration are the regression signal: a
+        // preflight that runs after the stop leaves the sandbox terminal and the
+        // rejected change already persisted, whatever the start then reports.
+        let saved = sandbox_entity::Entity::find_by_id(row.id)
+            .one(db.read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.status,
+            SandboxStatus::Running,
+            "the restart preflight must fail before stopping the workload"
+        );
+
+        let persisted: SandboxConfig = serde_json::from_str(&saved.config).unwrap();
+        assert_eq!(
+            persisted.spec.runtime.workdir, config.spec.runtime.workdir,
+            "the rejected change must not be persisted"
+        );
+        assert_eq!(
+            persisted.local_network_config().unwrap().outbound_proxy,
+            config.local_network_config().unwrap().outbound_proxy,
+            "the durable network configuration must be unchanged"
+        );
+
+        // The refusal is the launch-contract gate, not a stop or start failure. The
+        // legacy gate names the proxy feature itself, so it cannot be satisfied by
+        // the `HTTP CONNECT proxy authentication` capability refusal.
+        let error = result.expect_err("an unsupported runtime must refuse the restart");
+        assert!(
+            error.to_string().contains("HTTP CONNECT outbound proxies")
+                && error.to_string().contains("upgrade msb"),
+            "unexpected error: {error}"
+        );
     }
 
     /// The `tls` change a secret patch emits when it must turn interception on.
@@ -5345,7 +6211,7 @@ mod tests {
         assert!(!config.local_network_config().unwrap().tls.enabled);
 
         let patch = patch_with_specs(vec![source_spec("API_KEY", &["api.example.com"])]);
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
 
         let network = config.local_network_config().unwrap();
         assert_eq!(network.secrets.secrets.len(), 1);
@@ -5478,7 +6344,7 @@ mod tests {
         );
         assert!(validate_apply_supported(&plan).is_ok());
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
         let network = config.local_network_config().unwrap();
         assert!(!network.tls.enabled);
         assert!(!network.secrets.secrets[0].require_tls_identity);
@@ -5513,7 +6379,7 @@ mod tests {
         );
         assert!(validate_apply_supported(&plan).is_err());
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
         let network = config.local_network_config().unwrap();
         assert!(network.tls.enabled);
         assert!(network.secrets.secrets[0].require_tls_identity);
@@ -5544,7 +6410,7 @@ mod tests {
 
         assert!(tls_plan_change(&plan).is_none());
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
         let network = config.local_network_config().unwrap();
         assert!(!network.tls.enabled);
         assert!(!network.secrets.secrets[0].require_tls_identity);
@@ -5586,7 +6452,7 @@ mod tests {
         );
         assert!(validate_apply_supported(&plan).is_err());
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
         let network = config.local_network_config().unwrap();
         assert_eq!(network.secrets.secrets.len(), 1);
         assert_eq!(network.secrets.secrets[0].env_var, "KEEP");
@@ -5626,7 +6492,7 @@ mod tests {
         assert!(tls_plan_change(&plan).is_none());
         assert!(validate_apply_supported(&plan).is_ok());
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
         let network = config.local_network_config().unwrap();
         assert_eq!(network.secrets.secrets.len(), 1);
         assert_eq!(network.secrets.secrets[0].env_var, "KEEP");
@@ -5654,7 +6520,7 @@ mod tests {
         );
         assert!(tls_plan_change(&plan).is_none());
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
 
         let network = config.local_network_config().unwrap();
         assert!(network.secrets.secrets.is_empty());
@@ -5688,7 +6554,7 @@ mod tests {
         let mut config = config(2, 1024);
         let patch = patch_with_specs(vec![source_spec("API_KEY", &["api.example.com"])]);
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
 
         let network = config.local_network_config().unwrap();
         let entry = &network.secrets.secrets[0];
@@ -5714,7 +6580,7 @@ mod tests {
         let mut config = config_with_secret("API_KEY", SECRET_SENTINEL);
         let patch = patch_with_specs(vec![source_spec("API_KEY", &[])]);
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
 
         let network = config.local_network_config().unwrap();
         let entry = &network.secrets.secrets[0];
@@ -5745,7 +6611,7 @@ mod tests {
         spec.value = zeroize::Zeroizing::new("caller-held-value".to_string());
         let patch = patch_with_specs(vec![spec]);
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
 
         // The value persists at rest (documented secret_env-style property)
         // and the entry is no longer reference-backed.
@@ -5765,7 +6631,7 @@ mod tests {
             ..SandboxModificationPatch::default()
         };
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
 
         let network = config.local_network_config().unwrap();
         assert!(network.secrets.secrets.is_empty());
@@ -5779,7 +6645,7 @@ mod tests {
         let mut config = config_with_secret("API_KEY", SECRET_SENTINEL);
         let patch = patch_with_specs(vec![bare_spec("API_KEY", &["*.example.org", "*"])]);
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
 
         let network = config.local_network_config().unwrap();
         assert_eq!(
@@ -5799,7 +6665,7 @@ mod tests {
         spec.placeholder = Some("$NEW_REF".to_string());
         let patch = patch_with_specs(vec![spec]);
 
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
 
         let network = config.local_network_config().unwrap();
         assert_eq!(network.secrets.secrets[0].placeholder, "$NEW_REF");
@@ -5832,7 +6698,7 @@ mod tests {
 
         // The persisted config drops the inlined value in favor of the
         // source reference.
-        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        config.update_secrets(&patch).unwrap();
         let config_json = serde_json::to_string(&config).unwrap();
         assert!(!config_json.contains(SECRET_SENTINEL));
         assert!(config_json.contains("\"var\":\"API_KEY\""));

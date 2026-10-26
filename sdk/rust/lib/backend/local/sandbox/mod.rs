@@ -23,6 +23,8 @@ use futures::{StreamExt, future::BoxFuture, stream};
 use microsandbox_db::pool::DbPools;
 use microsandbox_db::{DbReadConnection, DbWriteConnection};
 use microsandbox_image::{Digest, GlobalCache};
+#[cfg(unix)]
+use microsandbox_runtime::ipc::SandboxSocketPaths;
 use sea_orm::{
     ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter, QueryOrder, QuerySelect,
     sea_query::Expr,
@@ -184,7 +186,8 @@ impl LocalBackend {
             }
         }
 
-        let mut config: SandboxConfig = serde_json::from_str::<SandboxConfig>(&model.config)?;
+        let mut config =
+            SandboxConfig::from_stored(&model.config, model.caller_config_overrides.as_deref())?;
         // Also cover starts after crashes or a stop performed by an older SDK. Lifecycle
         // ownership alone can become available during Linux's deferred disk/KVM teardown.
         // Observe only this sandbox's owned markers; actual shared-disk conflicts still fail
@@ -195,6 +198,12 @@ impl LocalBackend {
             Duration::from_secs(5),
         )
         .await?;
+
+        #[cfg(unix)]
+        microsandbox_runtime::maintenance::remove_bootstrap_trampoline(
+            &self.sandboxes_dir().join(name),
+        )?;
+
         // A failed or interrupted first restore is not a stopped ordinary VM. In particular,
         // its sealed base may be hard-linked to a snapshot and must never become a boot disk.
         Self::validate_completed_restore(&config)?;
@@ -394,6 +403,18 @@ impl LocalBackend {
             })??;
         }
         if all_dead {
+            #[cfg(unix)]
+            {
+                let _ownership = crate::runtime::acquire_sandbox_lifecycle_guard(
+                    &self.config().run_dir(),
+                    name,
+                    Duration::from_secs(5),
+                )
+                .await?;
+                microsandbox_runtime::maintenance::remove_bootstrap_trampoline(
+                    &self.sandboxes_dir().join(name),
+                )?;
+            }
             let db = self.db().await?.write();
             if let Err(e) = Self::update_sandbox_status(db, model.id, SandboxStatus::Stopped).await
             {
@@ -798,10 +819,21 @@ impl LocalBackend {
         #[cfg(not(windows))]
         let run = Self::load_active_run(pools.read(), sandbox.id).await?;
 
-        // An unowned Starting claim with no run is an abandoned launcher. Both guards above
-        // prove there is no creator in the Windows lock handoff gap and no resident runtime.
+        // Both guards exclude current launchers and runtimes, including the Windows
+        // handoff gap. Old Unix runtimes may own only a socket, so probe before reaping.
         // Without filesystem ownership information, retain the conservative observation.
         let Some(run) = run else {
+            #[cfg(unix)]
+            if sandbox.status == SandboxStatus::Starting
+                && let Some((run_dir, sandboxes_dir)) = socket_roots
+            {
+                let socket_paths =
+                    SandboxSocketPaths::in_sandboxes_dir(run_dir, sandboxes_dir, &sandbox.name);
+                if socket_paths.may_be_live().await? {
+                    return Ok(sandbox);
+                }
+            }
+
             if sandbox.status == SandboxStatus::Draining
                 || (sandbox.status == SandboxStatus::Starting && socket_roots.is_some())
             {
@@ -1548,6 +1580,8 @@ mod tests {
     use std::fs;
     use std::io::Write;
     #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
+    #[cfg(unix)]
     use std::process::Command;
     use std::sync::Arc;
     #[cfg(unix)]
@@ -1568,6 +1602,8 @@ mod tests {
         DEFAULT_STOP_TIMEOUT, OciRootfsSource, RootfsSource, SandboxConfig, SandboxListBuilder,
         SandboxStatus,
     };
+    #[cfg(unix)]
+    use microsandbox_runtime::ipc::RuntimeSocketPaths;
 
     #[test]
     fn local_stop_policy_preserves_existing_escalation() {
@@ -1982,6 +2018,30 @@ mod tests {
             SandboxStatus::Starting
         );
         drop(transition);
+        #[cfg(unix)]
+        {
+            let socket =
+                RuntimeSocketPaths::new(&backend.config().run_dir(), "abandoned").legacy_agent;
+            std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+            let listener = UnixListener::bind(&socket).unwrap();
+            assert_eq!(
+                backend
+                    .sandbox_handle_state("abandoned", Some(id))
+                    .await
+                    .unwrap()
+                    .0
+                    .status,
+                SandboxStatus::Starting
+            );
+            assert!(
+                socket.exists(),
+                "reconciliation must preserve the live legacy endpoint"
+            );
+            drop(listener);
+            // macOS may defer teardown while a probe connection is queued.
+            std::fs::remove_file(&socket).unwrap();
+        }
+
         let (recovered, _) = backend
             .sandbox_handle_state("abandoned", Some(id))
             .await
@@ -2100,22 +2160,18 @@ mod tests {
             .unwrap();
         let run_dir = temp.path().join("run");
         let sandboxes_dir = temp.path().join("sandboxes");
+
         #[cfg(unix)]
         let socket_paths = {
-            let paths = microsandbox_runtime::ipc::sandbox_socket_paths(&run_dir, "stale");
+            let paths = RuntimeSocketPaths::new(&run_dir, "stale");
             std::fs::create_dir_all(&paths.canonical_dir).unwrap();
             std::fs::write(&paths.agent, b"stale").unwrap();
             std::fs::write(&paths.control, b"stale").unwrap();
-            microsandbox_runtime::ipc::publish_legacy_agent_link(&run_dir, "stale", &paths.agent)
-                .unwrap();
-            microsandbox_runtime::ipc::publish_legacy_control_link(
-                &run_dir,
-                "stale",
-                &paths.control,
-            )
-            .unwrap();
+            paths.publish_legacy_agent_link(&paths.agent).unwrap();
+            paths.publish_legacy_control_link(&paths.control).unwrap();
             paths
         };
+
         let reconciled = LocalBackend::reconcile_sandbox_runtime_state_with_paths(
             &pools,
             sandbox,

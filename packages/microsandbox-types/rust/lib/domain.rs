@@ -576,26 +576,55 @@ pub enum Patch {
 // Types: Networking
 //--------------------------------------------------------------------------------------------------
 
-/// HTTP responses returned when network policy denies a request.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ConfigPatch)]
+/// Wire format of HTTP denial responses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum HttpDenyResponseFormat {
+    /// Legacy plain-text network denials with host substitution.
+    Text,
+
+    /// JSON network and secret denials with literal messages.
+    #[default]
+    Json,
+}
+
+/// HTTP responses returned for network and secret policy denials.
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct HttpConfig {
-    /// Return readable HTTP 403 responses for supported denied requests. Default: false.
+    /// Return readable HTTP 403 responses for supported denied requests. Default: true.
     pub deny_response: bool,
 
-    /// Denial response body. `{host}` names the blocked host.
-    /// Used only when `deny_response` is enabled. Omission uses the default;
-    /// an empty string produces an empty body.
+    /// Omission uses the runtime default: JSON.
+    pub deny_response_format: HttpDenyResponseFormat,
+
+    /// Legacy plain-text message with `{host}` substitution. Deprecated: use JSON mode
+    /// and `network_deny_message` for new integrations. Ignored in JSON mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deny_message: Option<String>,
+
+    /// Network-denial JSON `message`. Used as-is.
+    /// Used only when `deny_response` is enabled in JSON mode. Omission uses the default;
+    /// an empty string preserves the error code with an empty `message`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_deny_message: Option<String>,
+
+    /// Secret-denial JSON `message`. Used as-is when `deny_response` is enabled in JSON mode.
+    /// Omission uses the default; an empty string leaves `message` empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_deny_message: Option<String>,
 }
 
 /// Complete network specification for a sandbox.
 ///
 /// Common, backend-visible fields are typed directly. Rich local-engine subdocuments such as policy, DNS, TLS, secrets, and interface overrides are carried as JSON so the shared contract can preserve them without depending on the local networking engine crate.
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -638,6 +667,10 @@ pub struct NetworkSpec {
     #[serde(rename = "max_connections", alias = "max_tcp_connections")]
     pub max_tcp_connections: Option<usize>,
 
+    /// Active inbound TCP connection cap across published ports. Omitted uses the runtime default; zero is unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inbound_tcp_connections: Option<usize>,
+
     /// Max concurrent UDP relay sessions. Omitted is unlimited for single-tenant and 1024 for multi-tenant; zero means unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_udp_connections: Option<usize>,
@@ -663,6 +696,7 @@ pub struct NetworkSpec {
 
     /// HTTP denial response settings.
     #[config_patch(nested)]
+    #[serde(default)]
     pub http: HttpConfig,
 
     /// Proxy used for outbound sandbox connections and supported datagram flows.
@@ -685,6 +719,9 @@ pub enum OutboundProxy {
     HttpConnect {
         /// Proxy socket address.
         address: String,
+        /// Optional username/password authentication configuration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credentials: Option<HttpConnectCredentials>,
     },
 
     /// A SOCKS4 proxy at the given `IP:port` address.
@@ -704,6 +741,21 @@ pub enum OutboundProxy {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credentials: Option<Socks5Credentials>,
     },
+}
+
+/// Environment-backed username/password credentials for an HTTP CONNECT proxy.
+///
+/// This durable configuration contains only the host-side password source.
+/// The resolved password is carried by the private launch contract instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HttpConnectCredentials {
+    /// HTTP CONNECT authentication username.
+    pub username: String,
+
+    /// Host-side source for the HTTP CONNECT authentication password.
+    pub password: SecretSource,
 }
 
 /// Environment-backed username/password credentials for a SOCKS5 proxy.
@@ -761,6 +813,7 @@ pub enum PortProtocol {
 
 /// Host services exposed to a sandbox through virtio-vsock.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -836,6 +889,7 @@ pub struct HandoffInit {
 
 /// Sandbox lifecycle policy.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SandboxPolicy {
@@ -909,6 +963,7 @@ pub struct SnapshotSpec {
 ///
 /// This is the durable contract for fields that are already shared across backends. Local-only execution state such as resolved manifest digests, snapshot upper-layer paths, registry credentials, replace flags, and backend dispatch stays outside this type.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -977,6 +1032,7 @@ pub struct SandboxSpec {
 
 /// CPU and memory resources for a sandbox.
 #[derive(Debug, Clone, Serialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SandboxResources {
@@ -1107,6 +1163,7 @@ pub enum GuestClockPolicy {
 
 /// Guest runtime options for a sandbox.
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -1901,6 +1958,18 @@ impl Default for SandboxRuntimeOptions {
     }
 }
 
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            deny_response: true,
+            deny_response_format: HttpDenyResponseFormat::Json,
+            deny_message: None,
+            network_deny_message: None,
+            secret_deny_message: None,
+        }
+    }
+}
+
 impl Default for NetworkSpec {
     fn default() -> Self {
         Self {
@@ -1915,6 +1984,7 @@ impl Default for NetworkSpec {
             max_tcp_connections: None,
             max_udp_connections: None,
             tcp_accept_queue_size: None,
+            max_inbound_tcp_connections: None,
             rate_limiter: None,
             nat64_prefixes: default_nat64_prefixes(),
             trust_host_cas: false,
@@ -2395,6 +2465,7 @@ pub const MAX_SECRET_PLACEHOLDER_BYTES: usize = 1024;
 /// The global `passthrough_hosts` field preserves historical defaults; its addition
 /// requires updating older exhaustive struct literals and patterns.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecretsConfig {
@@ -2846,6 +2917,7 @@ fn validate_placeholder(placeholder: &str, secret_index: usize) -> Result<(), Se
 /// is handled by proxy tasks — these fields configure which ports/domains are
 /// intercepted and how the interception CA is sourced.
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TlsConfig {
@@ -3144,6 +3216,7 @@ fn action_deny() -> Action {
 
 /// DNS interception and filtering settings. Carried in [`NetworkSpec::dns`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -3171,6 +3244,7 @@ impl Default for DnsConfig {
 /// sandbox slot by the local network engine. Carried in
 /// [`NetworkSpec::interface`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -3222,6 +3296,7 @@ pub enum NetworkRateLimitDirection {
 
 /// Egress and ingress rate limits for a local sandbox network.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigPatch)]
+#[config_patch(serde_lossless)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]

@@ -442,6 +442,14 @@ static msb_sandbox_compact_fn ptr_msb_sandbox_compact = NULL;
 // dlopen handle — set once by load_microsandbox, never closed.
 static void *lib_handle = NULL;
 
+bool has_port_modification(void) {
+    return lib_handle && dlsym(lib_handle, "msb_supports_port_modification") != NULL;
+}
+
+bool has_secret_policy_modification(void) {
+    return lib_handle && dlsym(lib_handle, "msb_supports_secret_policy_modification") != NULL;
+}
+
 // load_error holds a static error string on dlopen/dlsym failure.
 // Not freed by callers — it lives for the process lifetime.
 static char load_error[1024] = {0};
@@ -1782,6 +1790,9 @@ type CreateOptions struct {
 	MaxDurationSecs      uint64               `json:"max_duration_secs,omitempty"`
 	IdleTimeoutSecs      uint64               `json:"idle_timeout_secs,omitempty"`
 	RegistryAuth         *RegistryAuthOptions `json:"registry_auth,omitempty"`
+	// RegistryAnonymous pulls without credentials. Mutually exclusive with
+	// RegistryAuth; libraries that predate it reject the request.
+	RegistryAnonymous bool `json:"registry_anonymous,omitempty"`
 	// RegistryInsecure pulls over plain HTTP instead of HTTPS.
 	RegistryInsecure bool `json:"registry_insecure,omitempty"`
 	// RegistryCACerts holds PEM-encoded CA root certificate bundles trusted
@@ -1848,32 +1859,36 @@ type MountSpec struct {
 
 // HTTPConfig carries HTTP denial settings to the native SDK.
 type HTTPConfig struct {
-	DenyResponse bool   `json:"deny_response"`
-	DenyMessage  string `json:"deny_message,omitempty"`
+	DenyResponseFormat string `json:"deny_response_format,omitempty"`
+	DenyMessage        string `json:"deny_message,omitempty"`
+	DenyResponse       bool   `json:"deny_response"`
+	NetworkDenyMessage string `json:"network_deny_message,omitempty"`
+	SecretDenyMessage  string `json:"secret_deny_message,omitempty"`
 }
 
 // NetworkOptions is the JSON representation of the network config block.
 type NetworkOptions struct {
-	CustomPolicy          *CustomNetworkPolicy       `json:"custom_policy,omitempty"`
-	DNS                   *DNSOptions                `json:"dns,omitempty"`
-	DNSRebindProtection   *bool                      `json:"dns_rebind_protection,omitempty"`
-	DenyDomains           []string                   `json:"deny_domains,omitempty"`
-	DenyDomainSuffixes    []string                   `json:"deny_domain_suffixes,omitempty"`
-	TLS                   *TLSOptions                `json:"tls,omitempty"`
-	Strict                *bool                      `json:"strict,omitempty"`
-	Ports                 map[uint16]uint16          `json:"ports,omitempty"`
-	PortBindings          []PortBindingOptions       `json:"port_bindings,omitempty"`
-	TCPAcceptQueueSize    *uint32                    `json:"tcp_accept_queue_size,omitempty"`
-	IPv4Pool              string                     `json:"ipv4_pool,omitempty"`
-	IPv6Pool              string                     `json:"ipv6_pool,omitempty"`
-	NAT64Prefixes         []string                   `json:"nat64_prefixes,omitempty"`
-	MaxConnections        *uint                      `json:"max_connections,omitempty"`
-	MaxTCPConnections     *uint                      `json:"max_tcp_connections,omitempty"`
-	MaxUDPConnections     *uint                      `json:"max_udp_connections,omitempty"`
-	RateLimiter           *NetworkRateLimiterOptions `json:"rate_limiter,omitempty"`
-	SecretViolationAction string                     `json:"secret_violation_action,omitempty"`
-	TrustHostCAs          *bool                      `json:"trust_host_cas,omitempty"`
-	HTTP                  *HTTPConfig                `json:"http,omitempty"`
+	CustomPolicy             *CustomNetworkPolicy       `json:"custom_policy,omitempty"`
+	DNS                      *DNSOptions                `json:"dns,omitempty"`
+	DNSRebindProtection      *bool                      `json:"dns_rebind_protection,omitempty"`
+	DenyDomains              []string                   `json:"deny_domains,omitempty"`
+	DenyDomainSuffixes       []string                   `json:"deny_domain_suffixes,omitempty"`
+	TLS                      *TLSOptions                `json:"tls,omitempty"`
+	Strict                   *bool                      `json:"strict,omitempty"`
+	Ports                    map[uint16]uint16          `json:"ports,omitempty"`
+	PortBindings             []PortBindingOptions       `json:"port_bindings,omitempty"`
+	TCPAcceptQueueSize       *uint32                    `json:"tcp_accept_queue_size,omitempty"`
+	MaxInboundTCPConnections *uint                      `json:"max_inbound_tcp_connections,omitempty"`
+	IPv4Pool                 string                     `json:"ipv4_pool,omitempty"`
+	IPv6Pool                 string                     `json:"ipv6_pool,omitempty"`
+	NAT64Prefixes            []string                   `json:"nat64_prefixes,omitempty"`
+	MaxConnections           *uint                      `json:"max_connections,omitempty"`
+	MaxTCPConnections        *uint                      `json:"max_tcp_connections,omitempty"`
+	MaxUDPConnections        *uint                      `json:"max_udp_connections,omitempty"`
+	RateLimiter              *NetworkRateLimiterOptions `json:"rate_limiter,omitempty"`
+	SecretViolationAction    string                     `json:"secret_violation_action,omitempty"`
+	TrustHostCAs             *bool                      `json:"trust_host_cas,omitempty"`
+	HTTP                     *HTTPConfig                `json:"http,omitempty"`
 }
 
 // RateLimiterOptions limits one traffic direction; a nil bucket leaves that
@@ -5988,4 +6003,27 @@ func Jobs(ctx context.Context, sandbox uint64, request any) (json.RawMessage, er
 		return C.call_msb_jobs(cancelID, C.uint64_t(sandbox), arg, buf, length)
 	})
 	return json.RawMessage(raw), err
+}
+
+// RequirePortModification rejects requests that an older library would ignore.
+func RequirePortModification() error {
+	if err := ensureLoaded(); err != nil {
+		return err
+	}
+	if !bool(C.has_port_modification()) {
+		return fmt.Errorf("published-port modification requires an updated native library")
+	}
+	return nil
+}
+
+// RequireSecretPolicyModification rejects secret policy edits that an older
+// library would skip.
+func RequireSecretPolicyModification() error {
+	if err := ensureLoaded(); err != nil {
+		return err
+	}
+	if !bool(C.has_secret_policy_modification()) {
+		return fmt.Errorf("secret policy modification requires an updated native library")
+	}
+	return nil
 }
