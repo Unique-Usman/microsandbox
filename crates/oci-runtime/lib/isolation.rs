@@ -1,7 +1,9 @@
 //! OCI namespace and resource requests mapped into one guest workload domain.
 
 use anyhow::{Result, bail, ensure};
-use microsandbox_protocol::isolation::{WorkloadIsolation, WorkloadResources};
+use microsandbox_protocol::isolation::{
+    WorkloadIsolation, WorkloadResources, WorkloadTimeNamespace, WorkloadTimeOffset,
+};
 use microsandbox_runtime::oci::OciBundle;
 use oci_spec::runtime::{LinuxNamespaceType, LinuxResources};
 
@@ -33,10 +35,32 @@ pub(crate) fn policy(bundle: &OciBundle) -> Result<WorkloadIsolation> {
                 LinuxNamespaceType::Ipc => policy.ipc = true,
                 LinuxNamespaceType::Uts => policy.uts = true,
                 LinuxNamespaceType::Cgroup => policy.cgroup = true,
-                LinuxNamespaceType::User | LinuxNamespaceType::Time => {
+                LinuxNamespaceType::Time => policy.time = Some(WorkloadTimeNamespace::default()),
+                LinuxNamespaceType::User => {
                     bail!("guest {kind} namespace configuration is not implemented")
                 }
                 LinuxNamespaceType::Network => unreachable!(),
+            }
+        }
+        if let Some(offsets) = linux.time_offsets() {
+            for (clock, offset) in offsets {
+                let time = policy.time.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("clock offsets require a guest time namespace")
+                })?;
+                let target = match clock.as_str() {
+                    "monotonic" => &mut time.monotonic,
+                    "boottime" => &mut time.boottime,
+                    _ => bail!("unsupported time namespace clock `{clock}`"),
+                };
+                let nanoseconds = offset.nanosecs().unwrap_or(0);
+                ensure!(
+                    nanoseconds < 1_000_000_000,
+                    "invalid time namespace nanoseconds"
+                );
+                *target = Some(WorkloadTimeOffset {
+                    seconds: offset.secs().unwrap_or(0),
+                    nanoseconds,
+                });
             }
         }
         ensure!(
@@ -203,23 +227,65 @@ mod tests {
         let requested = bundle(
             serde_json::json!([
                 {"type": "pid"}, {"type": "mount"}, {"type": "ipc"},
-                {"type": "uts"}, {"type": "cgroup"},
+                {"type": "uts"}, {"type": "cgroup"}, {"type": "time"},
                 {"type": "network", "path": "/run/netns/container"}
             ]),
             "workload",
         );
         let mapped = policy(&requested).unwrap();
         assert!(mapped.pid && mapped.mount && mapped.ipc && mapped.uts && mapped.cgroup);
+        assert!(mapped.time.is_some());
         assert_eq!(mapped.hostname.as_deref(), Some("workload"));
         for namespaces in [
             serde_json::json!([{"type": "mount", "path": "/proc/1/ns/mnt"}]),
             serde_json::json!([{"type": "pid"}]),
             serde_json::json!([{"type": "user"}]),
-            serde_json::json!([{"type": "time"}]),
+            serde_json::json!([{"type": "time", "path": "/proc/1/ns/time"}]),
         ] {
             assert!(policy(&bundle(namespaces, "")).is_err());
         }
         assert!(policy(&bundle(serde_json::json!([]), "workload")).is_err());
+    }
+
+    #[test]
+    fn maps_time_offsets_and_rejects_invalid_requests() {
+        let bundle = |linux| OciBundle {
+            path: "/bundle".into(),
+            spec: serde_json::from_value(serde_json::json!({
+                "ociVersion": "1.2.0", "linux": linux
+            }))
+            .unwrap(),
+        };
+        let request = serde_json::json!({
+            "namespaces": [{"type": "time"}],
+            "timeOffsets": {
+                "monotonic": {"secs": -2, "nanosecs": 123},
+                "boottime": {"secs": 34}
+            }
+        });
+        let time = policy(&bundle(request)).unwrap().time.unwrap();
+        assert_eq!(
+            time.monotonic.unwrap(),
+            WorkloadTimeOffset {
+                seconds: -2,
+                nanoseconds: 123
+            }
+        );
+        assert_eq!(
+            time.boottime.unwrap(),
+            WorkloadTimeOffset {
+                seconds: 34,
+                nanoseconds: 0
+            }
+        );
+
+        for invalid in [
+            serde_json::json!({"timeOffsets": {"monotonic": {"secs": 1}}}),
+            serde_json::json!({"namespaces": [{"type": "time"}], "timeOffsets": {"realtime": {"secs": 1}}}),
+            serde_json::json!({"namespaces": [{"type": "time"}], "timeOffsets": {"monotonic": {"nanosecs": 1000000000}}}),
+        ] {
+            assert!(policy(&bundle(invalid)).is_err());
+        }
     }
 
     #[test]

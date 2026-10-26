@@ -13,12 +13,13 @@ use crate::workload::WorkloadPlacement;
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-const NAMESPACES: [(i32, &std::ffi::CStr); 5] = [
+const NAMESPACES: [(i32, &std::ffi::CStr); 6] = [
     (libc::CLONE_NEWNS, c"/proc/self/ns/mnt"),
     (libc::CLONE_NEWIPC, c"/proc/self/ns/ipc"),
     (libc::CLONE_NEWUTS, c"/proc/self/ns/uts"),
     (libc::CLONE_NEWPID, c"/proc/self/ns/pid"),
     (libc::CLONE_NEWCGROUP, c"/proc/self/ns/cgroup"),
+    (libc::CLONE_NEWTIME, c"/proc/self/ns/time"),
 ];
 
 // libc 0.2.190's GNU constant is truncated to c_int; clone3 requires the 64-bit flag.
@@ -52,6 +53,7 @@ pub(crate) struct NamespaceChild {
     policy: WorkloadIsolation,
     handles: Vec<OwnedFd>,
     initial: bool,
+    time_offsets: Vec<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -73,6 +75,16 @@ impl NamespaceDomain {
                 io::ErrorKind::InvalidInput,
                 "invalid workload hostname",
             ));
+        }
+        if let Some(time) = &policy.time {
+            for offset in [&time.monotonic, &time.boottime].into_iter().flatten() {
+                if offset.nanoseconds >= 1_000_000_000 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid time namespace nanoseconds",
+                    ));
+                }
+            }
         }
         Ok(Arc::new(Self {
             policy,
@@ -100,6 +112,18 @@ impl NamespaceDomain {
         };
         let (parent, child) = socket_pair()?;
         let (pid_read, pid_write) = pipe_pair()?;
+        // Format before fork: the child's pre-exec path must not allocate.
+        let mut time_offsets = Vec::new();
+        if let Some(time) = &self.policy.time {
+            for (clock, offset) in [("monotonic", &time.monotonic), ("boottime", &time.boottime)] {
+                if let Some(offset) = offset {
+                    time_offsets.push(format!(
+                        "{clock} {} {}\n",
+                        offset.seconds, offset.nanoseconds
+                    ));
+                }
+            }
+        }
         if initial {
             *state = DomainState::Failed;
         }
@@ -116,6 +140,7 @@ impl NamespaceDomain {
                 policy: self.policy.clone(),
                 handles,
                 initial,
+                time_offsets,
             },
         ))
     }
@@ -130,6 +155,28 @@ impl NamespaceChild {
             let initial_flags = flags & !libc::CLONE_NEWCGROUP;
             if initial_flags != 0 {
                 syscall_result(unsafe { libc::unshare(initial_flags) })?;
+            }
+            // unshare leaves this launcher outside the new time namespace. Offsets
+            // must be written before clone3 creates its first member and freezes them.
+            for offset in &self.time_offsets {
+                let fd = unsafe {
+                    libc::open(
+                        c"/proc/self/timens_offsets".as_ptr(),
+                        libc::O_WRONLY | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                let written =
+                    unsafe { libc::write(fd.as_raw_fd(), offset.as_ptr().cast(), offset.len()) };
+                if written < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if written as usize != offset.len() {
+                    return Err(io::Error::from_raw_os_error(libc::EIO));
+                }
             }
             if self.policy.mount {
                 syscall_result(unsafe {
@@ -309,6 +356,11 @@ fn namespace_flags(policy: &WorkloadIsolation) -> i32 {
         | (if policy.ipc { libc::CLONE_NEWIPC } else { 0 })
         | (if policy.uts { libc::CLONE_NEWUTS } else { 0 })
         | (if policy.pid { libc::CLONE_NEWPID } else { 0 })
+        | (if policy.time.is_some() {
+            libc::CLONE_NEWTIME
+        } else {
+            0
+        })
         | (if policy.cgroup {
             libc::CLONE_NEWCGROUP
         } else {
@@ -399,7 +451,7 @@ fn reap(pid: i32) {
 }
 
 fn send_namespaces(socket: RawFd, policy: &WorkloadIsolation) -> io::Result<()> {
-    let mut fds = [-1; 6];
+    let mut fds = [-1; NAMESPACES.len() + 1];
     let mut count = 0;
     let result = (|| {
         for (_, name) in active_namespaces(policy) {
@@ -503,4 +555,43 @@ fn receive_namespaces(socket: RawFd, expected: usize) -> io::Result<Vec<OwnedFd>
         ));
     }
     Ok(handles)
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use microsandbox_protocol::isolation::{WorkloadTimeNamespace, WorkloadTimeOffset};
+
+    use super::*;
+
+    #[test]
+    fn time_namespace_validates_offsets_before_fork() {
+        let mut policy = WorkloadIsolation {
+            time: Some(WorkloadTimeNamespace {
+                monotonic: Some(WorkloadTimeOffset {
+                    seconds: 0,
+                    nanoseconds: 1_000_000_000,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(NamespaceDomain::new(policy.clone()).is_err());
+        policy
+            .time
+            .as_mut()
+            .unwrap()
+            .monotonic
+            .as_mut()
+            .unwrap()
+            .nanoseconds = 999_999_999;
+        assert!(NamespaceDomain::new(policy.clone()).is_ok());
+        assert_eq!(
+            active_namespaces(&policy).collect::<Vec<_>>(),
+            [(libc::CLONE_NEWTIME, c"/proc/self/ns/time")]
+        );
+    }
 }

@@ -51,13 +51,24 @@ inside that namespace. Every later exec joins the same pinned namespace set.
 The short-lived launch helper is reaped immediately; there is no persistent
 monitor or second container runtime inside the VM.
 
-PID, mount, IPC, UTS and cgroup namespaces are supported in the guest. The rootfs
-and configured mounts are prepared once. The workload receives private proc,
+PID, mount, IPC, UTS, cgroup and time namespaces are supported in the guest.
+The rootfs and configured mounts are prepared once. The workload receives private proc,
 mqueue and read-only cgroup views where requested. `--hostname` configures the
-workload's UTS namespace. Agentd keeps its own management namespaces. User/time
+workload's UTS namespace. Agentd keeps its own management namespaces. User
 namespaces, UID/GID mappings and joining host namespace paths from the guest are
 not implemented and fail explicitly. Host network namespace handling remains
 separate and unchanged; this does not add Docker port forwarding or network DNS.
+
+Time namespaces isolate monotonic and boot-time clocks, not wall-clock time or
+timezones. OCI `linux.timeOffsets` accepts `monotonic` and `boottime` offsets;
+the launcher applies them before the first workload enters the namespace.
+Init and later execs share the same pinned namespace. Unknown clocks, invalid
+nanoseconds, offsets without a time namespace, and host namespace paths are
+rejected. The guest kernel must enable `CONFIG_TIME_NS`.
+Rebuild and install the matching embedded agent and host binaries for this
+support. The optional wire field is omitted when unused; older agents reject
+requests containing it rather than silently omitting isolation. Restart Docker
+after installation so its cached runtime feature report is refreshed.
 
 The guest workload cgroup applies CPU quota/period, CPU shares translated to v2
 weight, memory, memory-plus-swap and task limits. Init, exec and descendants

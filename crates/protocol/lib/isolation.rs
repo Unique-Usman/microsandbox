@@ -24,10 +24,33 @@ pub struct WorkloadIsolation {
     pub uts: bool,
     /// Hide ancestor cgroups from the workload.
     pub cgroup: bool,
+    /// Isolate monotonic and boot-time clocks; absent for existing workloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<WorkloadTimeNamespace>,
     /// Hostname applied only in the workload UTS namespace.
     pub hostname: Option<String>,
     /// Resource ceilings for the workload, excluding agentd.
     pub resources: WorkloadResources,
+}
+
+/// Clock offsets applied before the first process enters the time namespace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkloadTimeNamespace {
+    /// Offset from the guest kernel's monotonic clock.
+    pub monotonic: Option<WorkloadTimeOffset>,
+    /// Offset from the guest kernel's boot-time clock.
+    pub boottime: Option<WorkloadTimeOffset>,
+}
+
+/// Signed seconds plus nonnegative nanoseconds for a namespaced clock.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkloadTimeOffset {
+    /// Signed whole seconds.
+    pub seconds: i64,
+    /// Fractional nanoseconds, strictly below one billion.
+    pub nanoseconds: u32,
 }
 
 /// Supported cgroup-v2 workload controls, in kernel units.
@@ -55,4 +78,30 @@ pub struct IsolatedExecRequest {
     pub process: ExecRequest,
     /// Create-once namespace and cgroup configuration.
     pub isolation: WorkloadIsolation,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_policy_omits_time_and_new_policy_round_trips() {
+        let previous = serde_json::json!({
+            "pid": true, "mount": true, "ipc": true, "uts": true,
+            "cgroup": true, "hostname": null, "resources": {}
+        });
+        let mut policy: WorkloadIsolation = serde_json::from_value(previous).unwrap();
+        assert!(policy.time.is_none());
+        assert!(serde_json::to_value(&policy).unwrap().get("time").is_none());
+
+        policy.time = Some(WorkloadTimeNamespace::default());
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&policy, &mut encoded).unwrap();
+        let decoded: WorkloadIsolation = ciborium::from_reader(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, policy);
+    }
 }

@@ -2185,6 +2185,7 @@ mod tests {
     use tokio::time;
 
     use microsandbox_protocol::exec::ExecRequest;
+    use microsandbox_protocol::isolation::{WorkloadTimeNamespace, WorkloadTimeOffset};
 
     use super::*;
 
@@ -2662,7 +2663,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "run inside unshare -Urmpf --mount-proc for private guest-like namespaces"]
     async fn isolated_init_and_exec_share_namespaces() {
-        for tty in [false, true] {
+        let inherited_offsets = fs::read_to_string("/proc/self/timens_offsets").unwrap();
+        for (tty, with_offsets) in [(false, false), (true, false), (false, true), (true, true)] {
             let domain = crate::workload_namespace::NamespaceDomain::new(
                 microsandbox_protocol::isolation::WorkloadIsolation {
                     pid: true,
@@ -2670,6 +2672,20 @@ mod tests {
                     ipc: true,
                     uts: true,
                     cgroup: true,
+                    time: Some(if with_offsets {
+                        WorkloadTimeNamespace {
+                            monotonic: Some(WorkloadTimeOffset {
+                                seconds: 12,
+                                nanoseconds: 345,
+                            }),
+                            boottime: Some(WorkloadTimeOffset {
+                                seconds: 34,
+                                nanoseconds: 567,
+                            }),
+                        }
+                    } else {
+                        WorkloadTimeNamespace::default()
+                    }),
                     hostname: Some("isolated-test".into()),
                     ..Default::default()
                 },
@@ -2698,11 +2714,22 @@ mod tests {
                 None,
             )
             .unwrap();
-            for kind in ["pid", "mnt", "ipc", "uts", "cgroup"] {
+            for kind in ["pid", "mnt", "ipc", "uts", "cgroup", "time"] {
                 let workload = fs::read_link(format!("/proc/{}/ns/{kind}", init.pid())).unwrap();
                 let agent = fs::read_link(format!("/proc/self/ns/{kind}")).unwrap();
                 assert_ne!(workload, agent, "agent must stay outside {kind} namespace");
             }
+            let offsets =
+                fs::read_to_string(format!("/proc/{}/timens_offsets", init.pid())).unwrap();
+            let expected = if with_offsets {
+                "monotonic 12 345 boottime 34 567"
+            } else {
+                &inherited_offsets
+            };
+            assert_eq!(
+                offsets.split_whitespace().collect::<Vec<_>>(),
+                expected.split_whitespace().collect::<Vec<_>>()
+            );
             let initial = time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .unwrap()
@@ -2713,7 +2740,7 @@ mod tests {
             assert!(String::from_utf8_lossy(&bytes).contains("INIT_PID=1"));
             let mut req = req.clone();
             req.cwd = Some("/tmp".into());
-            req.args = vec!["-exc".into(), "test \"$PWD\" = /tmp; test \"$(cat /proc/sys/kernel/hostname)\" = isolated-test; for kind in pid mnt ipc uts cgroup; do test \"$(readlink /proc/self/ns/$kind)\" = \"$(readlink /proc/1/ns/$kind)\"; done; test \"$(cat /proc/1/comm)\" = sh; test \"$(cat /proc/self/cgroup)\" = '0::/'; test ! -w /sys/fs/cgroup/cgroup.procs; exit 37".into()];
+            req.args = vec!["-exc".into(), "test \"$PWD\" = /tmp; test \"$(cat /proc/sys/kernel/hostname)\" = isolated-test; for kind in pid mnt ipc uts cgroup time; do test \"$(readlink /proc/self/ns/$kind)\" = \"$(readlink /proc/1/ns/$kind)\"; done; test \"$(cat /proc/self/timens_offsets)\" = \"$(cat /proc/1/timens_offsets)\"; test \"$(cat /proc/1/comm)\" = sh; test \"$(cat /proc/self/cgroup)\" = '0::/'; test ! -w /sys/fs/cgroup/cgroup.procs; exit 37".into()];
             let (tx, mut exec_rx) = SessionOutputSender::channel();
             let _exec = ExecSession::spawn(
                 2,
