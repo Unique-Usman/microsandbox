@@ -903,7 +903,11 @@ impl LocalBackend {
                     .handle_mut()
                     .terminate_failed_startup()
                     .await;
-                return Err(startup_error_with_cleanup(error, cleanup));
+                let error = startup_error_with_cleanup(error, cleanup);
+                return Err(startup_error_with_stderr(
+                    error,
+                    startup_stderr_path.as_deref(),
+                ));
             }
         };
 
@@ -1946,6 +1950,7 @@ fn startup_error_with_stderr(error: MicrosandboxError, path: Option<&Path>) -> M
         None => error,
     }
 }
+
 /// Resolve bind mounts whose host source is a regular file.
 ///
 /// The runtime opens the source directly through `SingleFileFs`; this map only
