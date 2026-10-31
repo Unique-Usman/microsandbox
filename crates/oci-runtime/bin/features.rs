@@ -11,7 +11,7 @@ pub(crate) fn oci_features_json() -> serde_json::Value {
         "hooks": [],
         "mountOptions": [],
         "linux": {
-            "namespaces": ["pid", "mount", "ipc", "uts", "cgroup", "network", "time"],
+            "namespaces": ["pid", "mount", "ipc", "uts", "cgroup", "network", "time", "user"],
             "capabilities": microsandbox_protocol::exec::EXEC_CAPABILITY_NAMES,
             "cgroup": {
                 "v1": false,
@@ -57,7 +57,7 @@ mod tests {
         assert_eq!(features["linux"]["cgroup"]["v1"], false);
         assert_eq!(features["linux"]["cgroup"]["v2"], true);
         assert!(
-            !features["linux"]["namespaces"]
+            features["linux"]["namespaces"]
                 .as_array()
                 .unwrap()
                 .iter()

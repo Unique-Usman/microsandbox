@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use microsandbox_protocol::isolation::WorkloadResources;
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::{Fd, OwnedObjectPath, Value};
@@ -61,16 +61,16 @@ pub async fn place(config: &HostCgroupConfig, pid: i32) -> RuntimeResult<()> {
 }
 
 async fn place_inner(config: &HostCgroupConfig, pid: i32) -> Result<()> {
-    ensure!(pid > 0, "invalid VMM PID for cgroup placement");
-    ensure!(
-        config.state_dir.is_absolute(),
-        "OCI state directory must be absolute"
-    );
+    if pid <= 0 {
+        bail!("invalid VMM PID for cgroup placement");
+    }
+    if !config.state_dir.is_absolute() {
+        bail!("OCI state directory must be absolute");
+    }
     let state_dir = &config.state_dir;
-    ensure!(
-        Path::new(CGROUP_ROOT).join("cgroup.controllers").is_file(),
-        "runmsb resource isolation requires host cgroup v2"
-    );
+    if !Path::new(CGROUP_ROOT).join("cgroup.controllers").is_file() {
+        bail!("runmsb resource isolation requires host cgroup v2");
+    }
     let limits = host_limits(&config.resources)?;
     let requested = &config.path;
     if requested.contains(':') {
@@ -134,22 +134,20 @@ fn cleanup_inner(state_dir: &Path) -> Result<()> {
             .as_str()
             .context("invalid host cgroup record")?,
     );
-    ensure!(
-        path.starts_with(CGROUP_ROOT) && path != Path::new(CGROUP_ROOT),
-        "unsafe host cgroup record"
-    );
-    ensure!(
-        !path
-            .components()
-            .any(|part| matches!(part, Component::ParentDir)),
-        "unsafe host cgroup path"
-    );
+    if !path.starts_with(CGROUP_ROOT) || path == Path::new(CGROUP_ROOT) {
+        bail!("unsafe host cgroup record");
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        bail!("unsafe host cgroup path");
+    }
     match fs::metadata(path) {
         Ok(metadata) => {
-            ensure!(
-                Some(metadata.ino()) == record["inode"].as_u64(),
-                "VMM cgroup ownership changed; refusing deletion"
-            );
+            if Some(metadata.ino()) != record["inode"].as_u64() {
+                bail!("VMM cgroup ownership changed; refusing deletion");
+            }
             // A populated cgroup cannot be removed. Never kill arbitrary occupants here.
             fs::remove_dir(path).context("remove stopped VMM cgroup")?;
         }
@@ -164,17 +162,17 @@ fn host_limits(resources: &WorkloadResources) -> Result<HostLimits> {
     let memory = guest_memory_mib(resources)?
         .map(|guest| (u64::from(guest) + HOST_RESERVE_MIB) * 1024 * 1024);
     let period = resources.cpu_period.unwrap_or(100_000);
-    ensure!(
-        (1_000..=1_000_000).contains(&period)
-            && resources.cpu_quota.is_none_or(|quota| quota >= 1_000),
-        "invalid host CPU quota or period"
-    );
-    ensure!(
-        resources
-            .cpu_weight
-            .is_none_or(|weight| (1..=10_000).contains(&weight)),
-        "invalid host CPU weight"
-    );
+    if !(1_000..=1_000_000).contains(&period)
+        || resources.cpu_quota.is_some_and(|quota| quota < 1_000)
+    {
+        bail!("invalid host CPU quota or period");
+    }
+    if resources
+        .cpu_weight
+        .is_some_and(|weight| !(1..=10_000).contains(&weight))
+    {
+        bail!("invalid host CPU weight");
+    }
     let cpu_quota = resources
         .cpu_quota
         .map(|quota| {
@@ -212,35 +210,33 @@ pub fn guest_memory_mib(resources: &WorkloadResources) -> RuntimeResult<Option<u
 
 fn cgroup_path(requested: &str) -> Result<PathBuf> {
     let relative = requested.trim_start_matches('/');
-    ensure!(
-        !relative.is_empty()
-            && Path::new(relative)
-                .components()
-                .all(|part| matches!(part, Component::Normal(_))),
-        "cgroup path must name a non-root group without parent components"
-    );
+    if relative.is_empty()
+        || Path::new(relative)
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        bail!("cgroup path must name a non-root group without parent components");
+    }
     Ok(Path::new(CGROUP_ROOT).join(relative))
 }
 
 fn systemd_names(requested: &str) -> Result<(String, String)> {
     let parts = requested.split(':').collect::<Vec<_>>();
-    ensure!(
-        parts.len() == 3,
-        "systemd cgroup path must be slice:prefix:name"
-    );
-    for part in &parts {
-        ensure!(
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte)),
-            "invalid systemd cgroup component"
-        );
+    if parts.len() != 3 {
+        bail!("systemd cgroup path must be slice:prefix:name");
     }
-    ensure!(
-        parts[0].ends_with(".slice"),
-        "systemd cgroup parent must be a slice"
-    );
+    for part in &parts {
+        if part.is_empty()
+            || part
+                .bytes()
+                .any(|byte| !byte.is_ascii_alphanumeric() && !b"_.-".contains(&byte))
+        {
+            bail!("invalid systemd cgroup component");
+        }
+    }
+    if !parts[0].ends_with(".slice") {
+        bail!("systemd cgroup parent must be a slice");
+    }
     Ok((parts[0].into(), format!("{}-{}.scope", parts[1], parts[2])))
 }
 
@@ -323,11 +319,12 @@ async fn place_systemd_on(
 
 fn open_pidfd(pid: u32) -> Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
-    ensure!(
-        fd >= 0,
-        "open VMM process handle: {}",
-        std::io::Error::last_os_error()
-    );
+    if fd < 0 {
+        bail!(
+            "open VMM process handle: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 

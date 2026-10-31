@@ -1069,6 +1069,7 @@ impl ExecSession {
             .map_err(|e| AgentdError::ExecSession(format!("invalid cwd: {e}")))?;
 
         let resolved_user = resolve_requested_user(req, default_user)?;
+        validate_namespace_user(workload_placement.as_ref(), resolved_user.as_ref())?;
         let default_home = default_home_dir(req, resolved_user.as_ref())?;
         let home_key = default_home
             .as_ref()
@@ -1323,6 +1324,7 @@ impl ExecSession {
         }
 
         let resolved_user = resolve_requested_user(req, default_user)?;
+        validate_namespace_user(workload_placement.as_ref(), resolved_user.as_ref())?;
         if let Some(home) = default_home_dir(req, resolved_user.as_ref())? {
             cmd.env("HOME", home.to_string_lossy().into_owned());
         }
@@ -1474,6 +1476,19 @@ fn prepare_namespaces(
             .map(|(parent, child)| (Some(parent), Some(child))),
         None => Ok((None, None)),
     }
+}
+
+fn validate_namespace_user(
+    placement: Option<&WorkloadPlacement>,
+    user: Option<&ResolvedUser>,
+) -> std::io::Result<()> {
+    if let Some(domain) = placement.and_then(|placement| placement.isolation.as_ref()) {
+        domain.validate_user(
+            user.map_or(0, |user| user.uid),
+            user.map_or(0, |user| user.gid),
+        )?;
+    }
+    Ok(())
 }
 
 fn spawn_piped_process_isolated(
@@ -2178,6 +2193,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
     use std::path::Path;
     use std::process::{Command as StdCommand, Stdio as StdStdio};
     use std::time::Duration;
@@ -2185,7 +2201,10 @@ mod tests {
     use tokio::time;
 
     use microsandbox_protocol::exec::ExecRequest;
-    use microsandbox_protocol::isolation::{WorkloadTimeNamespace, WorkloadTimeOffset};
+    use microsandbox_protocol::isolation::{
+        WorkloadIdMapping, WorkloadIsolation, WorkloadTimeNamespace, WorkloadTimeOffset,
+        WorkloadUserNamespace,
+    };
 
     use super::*;
 
@@ -2740,7 +2759,7 @@ mod tests {
             assert!(String::from_utf8_lossy(&bytes).contains("INIT_PID=1"));
             let mut req = req.clone();
             req.cwd = Some("/tmp".into());
-            req.args = vec!["-exc".into(), "test \"$PWD\" = /tmp; test \"$(cat /proc/sys/kernel/hostname)\" = isolated-test; for kind in pid mnt ipc uts cgroup time; do test \"$(readlink /proc/self/ns/$kind)\" = \"$(readlink /proc/1/ns/$kind)\"; done; test \"$(cat /proc/self/timens_offsets)\" = \"$(cat /proc/1/timens_offsets)\"; test \"$(cat /proc/1/comm)\" = sh; test \"$(cat /proc/self/cgroup)\" = '0::/'; test ! -w /sys/fs/cgroup/cgroup.procs; exit 37".into()];
+            req.args = vec!["-exc".into(), "test \"$PWD\" = /tmp; test \"$(cat /proc/sys/kernel/hostname)\" = isolated-test; for kind in pid mnt ipc uts cgroup time; do test \"$(readlink /proc/self/ns/$kind)\" = \"$(readlink /proc/1/ns/$kind)\"; done; test \"$(cat /proc/self/timens_offsets)\" = \"$(cat /proc/1/timens_offsets)\"; test \"$(cat /proc/1/comm)\" = sh; test \"$(cat /proc/self/cgroup)\" = '0::/'; if (echo $ > /sys/fs/cgroup/cgroup.procs) 2>/dev/null; then exit 93; fi; exit 37".into()];
             let (tx, mut exec_rx) = SessionOutputSender::channel();
             let _exec = ExecSession::spawn(
                 2,
@@ -2796,6 +2815,169 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "run inside a private privileged mount/PID namespace with UID/GID map permissions"]
+    async fn isolated_user_namespace_is_shared_by_init_and_exec() {
+        for (tty, guest_id) in [(false, 0), (true, 0), (false, 100000), (true, 100000)] {
+            let directory = std::env::temp_dir().join(format!(
+                "msb-userns-{}-{tty}-{guest_id}",
+                std::process::id()
+            ));
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+            let application_file = directory.join("application");
+            let management_file = directory.join("management");
+            for path in [&application_file, &management_file] {
+                fs::write(path, "unchanged\n").unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            chown(&application_file, Some(guest_id), Some(guest_id)).unwrap();
+
+            let domain = crate::workload_namespace::NamespaceDomain::new(WorkloadIsolation {
+                pid: true,
+                mount: true,
+                ipc: true,
+                uts: true,
+                cgroup: true,
+                hostname: Some("userns-test".into()),
+                user: Some(WorkloadUserNamespace {
+                    uid_mappings: vec![WorkloadIdMapping {
+                        container_id: 0,
+                        guest_id,
+                        size: 1,
+                    }],
+                    gid_mappings: vec![WorkloadIdMapping {
+                        container_id: 0,
+                        guest_id,
+                        size: 1,
+                    }],
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut request = ExecRequest {
+                cmd: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo READY; read line; exit 23".into()],
+                env: Vec::new(),
+                cwd: None,
+                user: Some("0:0".into()),
+                tty,
+                rows: 24,
+                cols: 80,
+                rlimits: Vec::new(),
+                security: None,
+            };
+            let (tx, mut rx) = SessionOutputSender::channel();
+            let init = ExecSession::spawn(
+                1,
+                &request,
+                tx,
+                None,
+                SecurityProfile::Default,
+                Some(WorkloadPlacement::for_namespace_test(Arc::clone(&domain))),
+                None,
+            )
+            .unwrap();
+            let init_user = fs::read_link(format!("/proc/{}/ns/user", init.pid())).unwrap();
+            assert_ne!(init_user, fs::read_link("/proc/self/ns/user").unwrap());
+            let output = time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(output.output, SessionOutput::Stdout(_)));
+
+            request.args = vec![
+                "-exc".into(),
+                r#"
+                    test "$(id -u)" = 0
+                    test "$(id -g)" = 0
+                    test "$(readlink /proc/self/ns/user)" = "$(readlink /proc/1/ns/user)"
+                    test "$(cat /proc/1/comm)" = sh
+                    test "$(cat /proc/sys/kernel/hostname)" = userns-test
+                    test "$(cat /proc/self/cgroup)" = '0::/'
+                    if (echo $$ > /sys/fs/cgroup/cgroup.procs) 2>/dev/null; then exit 93; fi
+                    echo APP_WRITE_OK > "$1/application"
+                    if [ "$2" != 0 ]; then
+                        if cat "$1/management" >/dev/null 2>&1; then exit 91; fi
+                        if (echo FORBIDDEN >> "$1/management") 2>/dev/null; then exit 92; fi
+                    fi
+                    exit 37
+                "#
+                .into(),
+                "userns-test".into(),
+                directory.to_string_lossy().into_owned(),
+                guest_id.to_string(),
+            ];
+            let (tx, mut exec_rx) = SessionOutputSender::channel();
+            let exec = ExecSession::spawn(
+                2,
+                &request,
+                tx,
+                None,
+                SecurityProfile::Default,
+                Some(WorkloadPlacement::for_namespace_test(Arc::clone(&domain))),
+                None,
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            let code = time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match exec_rx.recv().await.unwrap().output {
+                        SessionOutput::Exited(code) => break code,
+                        SessionOutput::Stdout(bytes) | SessionOutput::Stderr(bytes) => {
+                            output.extend(bytes)
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                code,
+                37,
+                "tty={tty}, guest_id={guest_id}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert_eq!(
+                fs::read_to_string(&application_file).unwrap(),
+                "APP_WRITE_OK\n"
+            );
+            assert_eq!(fs::metadata(&application_file).unwrap().uid(), guest_id);
+            assert_eq!(fs::read_to_string(&management_file).unwrap(), "unchanged\n");
+            assert_eq!(fs::metadata(&management_file).unwrap().uid(), 0);
+            drop(exec);
+
+            request.user = Some("1234:1234".into());
+            let (tx, _) = SessionOutputSender::channel();
+            assert!(
+                ExecSession::spawn(
+                    3,
+                    &request,
+                    tx,
+                    None,
+                    SecurityProfile::Default,
+                    Some(WorkloadPlacement::for_namespace_test(domain)),
+                    None
+                )
+                .is_err(),
+                "unmapped exec IDs must not run with agentd credentials"
+            );
+            init.write_stdin(b"done\n").await.unwrap();
+            let code = time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let SessionOutput::Exited(code) = rx.recv().await.unwrap().output {
+                        break code;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(code, 23);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "requires unshare -Urm inside a private delegated systemd scope and MSB_TEST_DELEGATED_CGROUP=1"]
     async fn isolated_exec_cannot_bypass_task_limit() {
         assert_eq!(
@@ -2828,11 +3010,24 @@ mod tests {
         )
         .unwrap();
 
-        for tty in [false, true] {
+        for (tty, user_namespace) in [(false, false), (true, false), (false, true), (true, true)] {
             let domain = crate::workload_namespace::NamespaceDomain::new(
                 microsandbox_protocol::isolation::WorkloadIsolation {
                     mount: true,
+                    pid: user_namespace,
                     cgroup: true,
+                    user: user_namespace.then(|| WorkloadUserNamespace {
+                        uid_mappings: vec![WorkloadIdMapping {
+                            container_id: 0,
+                            guest_id: 100000,
+                            size: 1,
+                        }],
+                        gid_mappings: vec![WorkloadIdMapping {
+                            container_id: 0,
+                            guest_id: 100000,
+                            size: 1,
+                        }],
+                    }),
                     ..Default::default()
                 },
             )

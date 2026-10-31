@@ -17,6 +17,14 @@ a migration of an already-booted VM. Agent generation 11 introduces
 `core.exec.isolated`; the existing client availability gate rejects older agents.
 No adapter or unrestricted fallback is supplied for this new feature.
 
+Application user namespaces additionally require the `oci_user_namespace`
+launch capability and `workload_user_namespace: true` in agent readiness.
+The optional `WorkloadIsolation.user` field is omitted when unused, preserving
+existing isolation payloads. An old host can still use a new agent; a new host
+refuses user-namespace requests to an old runtime or agent before execution.
+UID/GID mapping targets are IDs in the parent guest namespace, not host-kernel
+IDs. Rootfs and host bind-mount ownership is never recursively rewritten.
+
 Existing ordinary exec payloads are unchanged. In an isolated VM they join its
 already configured domain. Agentd rejects reconfiguration after any execution
 attempt and rejects further execution after failed namespace setup. The original

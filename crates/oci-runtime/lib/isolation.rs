@@ -1,8 +1,9 @@
 //! OCI namespace and resource requests mapped into one guest workload domain.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, bail};
 use microsandbox_protocol::isolation::{
-    WorkloadIsolation, WorkloadResources, WorkloadTimeNamespace, WorkloadTimeOffset,
+    WorkloadIdMapping, WorkloadIsolation, WorkloadResources, WorkloadTimeNamespace,
+    WorkloadTimeOffset, WorkloadUserNamespace,
 };
 use microsandbox_runtime::oci::OciBundle;
 use oci_spec::runtime::{LinuxNamespaceType, LinuxResources};
@@ -25,10 +26,9 @@ pub(crate) fn policy(bundle: &OciBundle) -> Result<WorkloadIsolation> {
             if kind == LinuxNamespaceType::Network {
                 continue;
             }
-            ensure!(
-                namespace.path().is_none(),
-                "cannot join a host {kind} namespace from the guest kernel"
-            );
+            if namespace.path().is_some() {
+                bail!("cannot join a host {kind} namespace from the guest kernel");
+            }
             match kind {
                 LinuxNamespaceType::Mount => policy.mount = true,
                 LinuxNamespaceType::Pid => policy.pid = true,
@@ -37,7 +37,7 @@ pub(crate) fn policy(bundle: &OciBundle) -> Result<WorkloadIsolation> {
                 LinuxNamespaceType::Cgroup => policy.cgroup = true,
                 LinuxNamespaceType::Time => policy.time = Some(WorkloadTimeNamespace::default()),
                 LinuxNamespaceType::User => {
-                    bail!("guest {kind} namespace configuration is not implemented")
+                    policy.user = Some(WorkloadUserNamespace::default());
                 }
                 LinuxNamespaceType::Network => unreachable!(),
             }
@@ -53,43 +53,64 @@ pub(crate) fn policy(bundle: &OciBundle) -> Result<WorkloadIsolation> {
                     _ => bail!("unsupported time namespace clock `{clock}`"),
                 };
                 let nanoseconds = offset.nanosecs().unwrap_or(0);
-                ensure!(
-                    nanoseconds < 1_000_000_000,
-                    "invalid time namespace nanoseconds"
-                );
+                if nanoseconds >= 1_000_000_000 {
+                    bail!("invalid time namespace nanoseconds");
+                }
                 *target = Some(WorkloadTimeOffset {
                     seconds: offset.secs().unwrap_or(0),
                     nanoseconds,
                 });
             }
         }
-        ensure!(
-            linux.uid_mappings().as_ref().is_none_or(Vec::is_empty)
-                && linux.gid_mappings().as_ref().is_none_or(Vec::is_empty),
-            "guest user namespace ID mappings are not implemented"
-        );
+        if let Some(user) = policy.user.as_mut() {
+            for mapping in linux.uid_mappings().as_deref().unwrap_or_default() {
+                user.uid_mappings.push(WorkloadIdMapping {
+                    container_id: mapping.container_id(),
+                    guest_id: mapping.host_id(),
+                    size: mapping.size(),
+                });
+            }
+            for mapping in linux.gid_mappings().as_deref().unwrap_or_default() {
+                user.gid_mappings.push(WorkloadIdMapping {
+                    container_id: mapping.container_id(),
+                    guest_id: mapping.host_id(),
+                    size: mapping.size(),
+                });
+            }
+            user.validate().map_err(anyhow::Error::msg)?;
+        } else if linux
+            .uid_mappings()
+            .as_ref()
+            .is_some_and(|mappings| !mappings.is_empty())
+            || linux
+                .gid_mappings()
+                .as_ref()
+                .is_some_and(|mappings| !mappings.is_empty())
+        {
+            bail!("UID/GID mappings require a guest user namespace");
+        }
         if let Some(resources) = linux.resources() {
             policy.resources = resource_policy(resources)?;
         }
     }
-    ensure!(
-        !(policy.pid || policy.cgroup || policy.ipc) || policy.mount,
-        "guest PID, IPC and cgroup namespaces require a private mount namespace"
-    );
+    if (policy.pid || policy.cgroup || policy.ipc) && !policy.mount {
+        bail!("guest PID, IPC and cgroup namespaces require a private mount namespace");
+    }
+    if policy.user.is_some() && (!policy.pid || !policy.mount) {
+        bail!("guest user namespaces require private PID and mount namespaces");
+    }
     if let Some(hostname) = bundle
         .spec
         .hostname()
         .as_ref()
         .filter(|name| !name.is_empty())
     {
-        ensure!(
-            policy.uts,
-            "setting a workload hostname requires a guest UTS namespace"
-        );
-        ensure!(
-            hostname.len() <= 63 && !hostname.as_bytes().contains(&0),
-            "invalid workload hostname"
-        );
+        if !policy.uts {
+            bail!("setting a workload hostname requires a guest UTS namespace");
+        }
+        if hostname.len() > 63 || hostname.as_bytes().contains(&0) {
+            bail!("invalid workload hostname");
+        }
         policy.hostname = Some(hostname.clone());
     }
     Ok(policy)
@@ -106,10 +127,9 @@ pub(crate) fn guest_cpus(resources: &WorkloadResources) -> Result<Option<u8>> {
         .cpu_quota
         .map(|quota| {
             let period = resources.cpu_period.unwrap_or(100_000);
-            ensure!(
-                (1_000..=1_000_000).contains(&period) && quota >= 1_000,
-                "invalid CPU quota or period"
-            );
+            if !(1_000..=1_000_000).contains(&period) || quota < 1_000 {
+                bail!("invalid CPU quota or period");
+            }
             // The guest agent and kernel must not consume the workload's virtual CPU capacity.
             let count = quota
                 .div_ceil(period)
@@ -123,88 +143,95 @@ pub(crate) fn guest_cpus(resources: &WorkloadResources) -> Result<Option<u8>> {
 fn resource_policy(resources: &LinuxResources) -> Result<WorkloadResources> {
     if let Some(block_io) = resources.block_io() {
         // Docker emits blockIO even without limits; older versions also emit weight: 0.
-        ensure!(
-            block_io.weight().is_none_or(|weight| weight == 0)
-                && block_io.leaf_weight().is_none_or(|weight| weight == 0)
-                && block_io.weight_device().as_ref().is_none_or(Vec::is_empty)
-                && block_io
-                    .throttle_read_bps_device()
-                    .as_ref()
-                    .is_none_or(Vec::is_empty)
-                && block_io
-                    .throttle_write_bps_device()
-                    .as_ref()
-                    .is_none_or(Vec::is_empty)
-                && block_io
-                    .throttle_read_iops_device()
-                    .as_ref()
-                    .is_none_or(Vec::is_empty)
-                && block_io
-                    .throttle_write_iops_device()
-                    .as_ref()
-                    .is_none_or(Vec::is_empty),
-            "guest block I/O resource controls are not implemented"
+        if block_io.weight().is_some_and(|weight| weight != 0)
+            || block_io.leaf_weight().is_some_and(|weight| weight != 0)
+            || block_io
+                .weight_device()
+                .as_ref()
+                .is_some_and(|devices| !devices.is_empty())
+            || block_io
+                .throttle_read_bps_device()
+                .as_ref()
+                .is_some_and(|devices| !devices.is_empty())
+            || block_io
+                .throttle_write_bps_device()
+                .as_ref()
+                .is_some_and(|devices| !devices.is_empty())
+            || block_io
+                .throttle_read_iops_device()
+                .as_ref()
+                .is_some_and(|devices| !devices.is_empty())
+            || block_io
+                .throttle_write_iops_device()
+                .as_ref()
+                .is_some_and(|devices| !devices.is_empty())
+        {
+            bail!("guest block I/O resource controls are not implemented");
+        }
+    }
+    if resources
+        .hugepage_limits()
+        .as_ref()
+        .is_some_and(|limits| !limits.is_empty())
+        || resources.network().is_some()
+        || resources
+            .rdma()
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        || resources
+            .unified()
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+    {
+        bail!(
+            "guest hugepage, network, RDMA and arbitrary unified cgroup controls are not implemented"
         );
     }
-    ensure!(
-        resources
-            .hugepage_limits()
-            .as_ref()
-            .is_none_or(Vec::is_empty)
-            && resources.network().is_none()
-            && resources
-                .rdma()
-                .as_ref()
-                .is_none_or(|value| value.is_empty())
-            && resources
-                .unified()
-                .as_ref()
-                .is_none_or(|value| value.is_empty()),
-        "guest hugepage, network, RDMA and arbitrary unified cgroup controls are not implemented"
-    );
     let mut result = WorkloadResources::default();
     if let Some(cpu) = resources.cpu() {
-        ensure!(
-            cpu.cpus().as_ref().is_none_or(String::is_empty)
-                && cpu.mems().as_ref().is_none_or(String::is_empty)
-                && cpu.realtime_runtime().is_none()
-                && cpu.realtime_period().is_none()
-                && cpu.burst().is_none()
-                && cpu.idle().is_none(),
-            "guest cpuset, realtime, burst and idle CPU controls are not implemented"
-        );
+        if cpu.cpus().as_ref().is_some_and(|cpus| !cpus.is_empty())
+            || cpu.mems().as_ref().is_some_and(|mems| !mems.is_empty())
+            || cpu.realtime_runtime().is_some()
+            || cpu.realtime_period().is_some()
+            || cpu.burst().is_some()
+            || cpu.idle().is_some()
+        {
+            bail!("guest cpuset, realtime, burst and idle CPU controls are not implemented");
+        }
         result.cpu_quota = positive_limit(cpu.quota(), "CPU quota")?;
         result.cpu_period = cpu.period().filter(|value| *value != 0);
-        if let Some(period) = result.cpu_period {
-            ensure!((1_000..=1_000_000).contains(&period), "invalid CPU period");
+        if let Some(period) = result.cpu_period
+            && !(1_000..=1_000_000).contains(&period)
+        {
+            bail!("invalid CPU period");
         }
-        if let Some(quota) = result.cpu_quota {
-            ensure!(
-                quota >= 1_000,
-                "CPU quota must be at least 1000 microseconds"
-            );
+        if let Some(quota) = result.cpu_quota
+            && quota < 1_000
+        {
+            bail!("CPU quota must be at least 1000 microseconds");
         }
         if let Some(shares) = cpu.shares().filter(|value| *value != 0) {
-            ensure!(
-                (2..=262_144).contains(&shares),
-                "CPU shares must be between 2 and 262144"
-            );
+            if !(2..=262_144).contains(&shares) {
+                bail!("CPU shares must be between 2 and 262144");
+            }
             result.cpu_weight = Some(1 + (shares - 2) * 9_999 / 262_142);
         }
     }
     if let Some(memory) = resources.memory() {
         #[allow(deprecated)]
         let kernel_limit = memory.kernel();
-        ensure!(
-            memory.reservation().is_none_or(|value| value == 0)
-                && kernel_limit.is_none_or(|value| value == 0)
-                && memory.kernel_tcp().is_none_or(|value| value == 0)
-                && memory.swappiness().is_none()
-                && memory.use_hierarchy() != Some(false)
-                && !memory.check_before_update().unwrap_or(false)
-                && !memory.disable_oom_killer().unwrap_or(false),
-            "guest memory reservation, separate kernel limits, swappiness, nonhierarchical accounting, update checks and OOM-disable controls are not implemented"
-        );
+        if memory.reservation().is_some_and(|value| value != 0)
+            || kernel_limit.is_some_and(|value| value != 0)
+            || memory.kernel_tcp().is_some_and(|value| value != 0)
+            || memory.swappiness().is_some()
+            || memory.use_hierarchy() == Some(false)
+            || memory.check_before_update().unwrap_or(false)
+            || memory.disable_oom_killer().unwrap_or(false)
+        {
+            bail!(
+                "guest memory reservation, separate kernel limits, swappiness, nonhierarchical accounting, update checks and OOM-disable controls are not implemented"
+            );
+        }
         result.memory_max = positive_limit(memory.limit(), "memory limit")?;
         if let Some(total) = positive_limit(memory.swap(), "memory plus swap limit")? {
             let memory = result
@@ -237,6 +264,37 @@ fn positive_limit(value: Option<i64>, name: &str) -> Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_application_user_namespace_and_rejects_incomplete_requests() {
+        let request = serde_json::json!({
+            "namespaces": [{"type":"user"}, {"type":"pid"}, {"type":"mount"}],
+            "uidMappings": [{"containerID":0, "hostID":100000, "size":65536}],
+            "gidMappings": [{"containerID":0, "hostID":200000, "size":65536}]
+        });
+        let bundle = |linux| OciBundle {
+            path: "/bundle".into(),
+            spec: serde_json::from_value(serde_json::json!({"ociVersion":"1.2.0", "linux":linux}))
+                .unwrap(),
+        };
+        let user = policy(&bundle(request.clone())).unwrap().user.unwrap();
+        assert_eq!(user.uid_mappings[0].guest_id, 100000);
+        assert_eq!(user.gid_mappings[0].guest_id, 200000);
+
+        for key in ["uidMappings", "gidMappings", "namespaces"] {
+            let mut invalid = request.clone();
+            invalid.as_object_mut().unwrap().remove(key);
+            assert!(policy(&bundle(invalid)).is_err(), "missing {key}");
+        }
+        let mut invalid = request;
+        invalid["namespaces"][0]["path"] = "/proc/1/ns/user".into();
+        assert!(
+            policy(&bundle(invalid))
+                .unwrap_err()
+                .to_string()
+                .contains("cannot join a host")
+        );
+    }
 
     #[test]
     fn maps_one_guest_namespace_set_and_rejects_host_paths() {

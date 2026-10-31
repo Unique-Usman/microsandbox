@@ -83,6 +83,10 @@ pub struct LaunchCapabilities {
     #[serde(default)]
     pub oci_isolation: bool,
 
+    /// OCI application user-namespace mappings, absent in older runtimes.
+    #[serde(default)]
+    pub oci_user_namespace: bool,
+
     /// Published-port listeners honor `network.tcp_accept_queue_size`. Older runtimes omit this
     /// feature and would silently ignore the field, so the SDK refuses to send it to them.
     #[serde(default)]

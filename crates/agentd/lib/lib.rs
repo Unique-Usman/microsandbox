@@ -17,6 +17,7 @@ mod root_disk;
 mod workload;
 mod workload_namespace;
 mod workload_resources;
+mod workload_user_namespace;
 
 //--------------------------------------------------------------------------------------------------
 // Exports

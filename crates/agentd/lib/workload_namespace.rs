@@ -8,12 +8,14 @@ use microsandbox_protocol::isolation::WorkloadIsolation;
 use rustix::mount::{self, FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags};
 
 use crate::workload::WorkloadPlacement;
+use crate::workload_user_namespace::PreparedUserNamespace;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-const NAMESPACES: [(i32, &std::ffi::CStr); 6] = [
+const NAMESPACES: [(i32, &std::ffi::CStr); 7] = [
+    (libc::CLONE_NEWUSER, c"/proc/self/ns/user"),
     (libc::CLONE_NEWNS, c"/proc/self/ns/mnt"),
     (libc::CLONE_NEWIPC, c"/proc/self/ns/ipc"),
     (libc::CLONE_NEWUTS, c"/proc/self/ns/uts"),
@@ -54,6 +56,7 @@ pub(crate) struct NamespaceChild {
     handles: Vec<OwnedFd>,
     initial: bool,
     time_offsets: Vec<String>,
+    user_namespace: Option<PreparedUserNamespace>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -61,12 +64,37 @@ pub(crate) struct NamespaceChild {
 //--------------------------------------------------------------------------------------------------
 
 impl NamespaceDomain {
+    pub(crate) fn validate_user(&self, uid: u32, gid: u32) -> io::Result<()> {
+        if let Some(user) = &self.policy.user {
+            for (id, mappings) in [(uid, &user.uid_mappings), (gid, &user.gid_mappings)] {
+                if !mappings.iter().any(|mapping| {
+                    id >= mapping.container_id
+                        && u64::from(id) < u64::from(mapping.container_id) + u64::from(mapping.size)
+                }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "requested application UID or GID is not mapped in the workload user namespace",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(policy: WorkloadIsolation) -> io::Result<Arc<Self>> {
         if (policy.pid || policy.cgroup || policy.ipc) && !policy.mount {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "guest PID, IPC and cgroup namespaces require a private mount namespace",
             ));
+        }
+        if let Some(user) = &policy.user {
+            user.validate().map_err(io::Error::other)?;
+            if !policy.pid || !policy.mount {
+                return Err(io::Error::other(
+                    "guest user namespaces require private PID and mount namespaces",
+                ));
+            }
         }
         if policy.hostname.as_ref().is_some_and(|name| {
             !policy.uts || name.is_empty() || name.len() > 63 || name.as_bytes().contains(&0)
@@ -127,6 +155,15 @@ impl NamespaceDomain {
         if initial {
             *state = DomainState::Failed;
         }
+        let user_namespace = if initial {
+            self.policy
+                .user
+                .as_ref()
+                .map(PreparedUserNamespace::new)
+                .transpose()?
+        } else {
+            None
+        };
         Ok((
             NamespaceParent {
                 socket: parent,
@@ -141,6 +178,7 @@ impl NamespaceDomain {
                 handles,
                 initial,
                 time_offsets,
+                user_namespace,
             },
         ))
     }
@@ -152,7 +190,12 @@ impl NamespaceChild {
     pub(crate) fn enter(&self, placement: &WorkloadPlacement) -> io::Result<()> {
         let flags = namespace_flags(&self.policy);
         if self.initial {
-            let initial_flags = flags & !libc::CLONE_NEWCGROUP;
+            // Prepare a private mount tree under the launcher's guest privileges.
+            let initial_flags = if self.user_namespace.is_some() {
+                libc::CLONE_NEWNS | (flags & libc::CLONE_NEWTIME)
+            } else {
+                flags & !libc::CLONE_NEWCGROUP
+            };
             if initial_flags != 0 {
                 syscall_result(unsafe { libc::unshare(initial_flags) })?;
             }
@@ -189,9 +232,25 @@ impl NamespaceChild {
                     )
                 })?;
             }
+            if self.user_namespace.is_some() {
+                // Inherited mounts become locked in a less-privileged mount namespace.
+                // Remove management views from this private staging tree first.
+                detach_mounts(c"/proc")?;
+                if self.policy.cgroup {
+                    detach_mounts(c"/sys/fs/cgroup")?;
+                }
+                if self.policy.ipc {
+                    let result = unsafe { libc::mkdir(c"/dev/mqueue".as_ptr(), 0o755) };
+                    if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    detach_mounts(c"/dev/mqueue")?;
+                }
+            }
         } else {
             for (fd, (flag, _)) in self.handles.iter().zip(active_namespaces(&self.policy)) {
-                if flag != libc::CLONE_NEWCGROUP {
+                if flag != libc::CLONE_NEWCGROUP && flag != libc::CLONE_NEWUSER {
                     syscall_result(unsafe { libc::setns(fd.as_raw_fd(), flag) })?;
                 }
             }
@@ -210,7 +269,14 @@ impl NamespaceChild {
         // CLONE_PARENT makes the real command agentd's child, not a child of a monitor.
         // No shared memory or stack: this has fork semantics on supported Linux hosts.
         let mut args: libc::clone_args = unsafe { std::mem::zeroed() };
-        args.flags = libc::CLONE_PARENT as u64;
+        if self.user_namespace.is_some() {
+            // NEWUSER cannot be combined with CLONE_PARENT. Agentd is a subreaper:
+            // the launcher exits after mapping IDs, adopting init back into agentd.
+            args.flags = (flags & !(libc::CLONE_NEWCGROUP | libc::CLONE_NEWTIME)) as u64;
+            args.exit_signal = libc::SIGCHLD as u64;
+        } else {
+            args.flags = libc::CLONE_PARENT as u64;
+        }
         // CLONE_PARENT inherits the launcher's exit signal; clone3 requires zero here.
         if let Some(directory) = &placement.cgroup_directory {
             // Migration after fork can exceed pids.max. Create atomically in the target
@@ -224,6 +290,15 @@ impl NamespaceChild {
             return Err(io::Error::last_os_error());
         }
         if pid > 0 {
+            if let Some(user) = &self.user_namespace
+                && let Err(error) = user.write_maps(pid)
+            {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                reap(pid);
+                return Err(error);
+            }
             let bytes = pid.to_ne_bytes();
             let sent = unsafe {
                 libc::send(
@@ -242,6 +317,16 @@ impl NamespaceChild {
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
                 }
+            }
+            if written == 4
+                && let Some(user) = &self.user_namespace
+                && let Err(error) = user.attach_mounts(&self.policy, pid)
+            {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                reap(pid);
+                return Err(error);
             }
             unsafe { libc::_exit(if written == 4 { 0 } else { 1 }) };
         }
@@ -263,6 +348,15 @@ impl NamespaceChild {
         if placement.cgroup_directory.is_none() {
             placement.place_current()?;
         }
+        if !self.initial && self.policy.user.is_some() {
+            // Agentd's launcher keeps its guest privileges until atomic cgroup
+            // placement. Only the application then enters the retained user namespace.
+            let user = self
+                .handles
+                .first()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+            syscall_result(unsafe { libc::setns(user.as_raw_fd(), libc::CLONE_NEWUSER) })?;
+        }
         if !self.initial && self.policy.cgroup {
             // Keep the launcher in agentd's cgroup namespace until clone3 has
             // placed the child. nsdelegate forbids cross-boundary migration from
@@ -275,17 +369,24 @@ impl NamespaceChild {
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
             syscall_result(unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWCGROUP) })?;
         }
+        if self.policy.user.is_some() {
+            syscall_result(unsafe { libc::setgroups(0, std::ptr::null()) })?;
+            syscall_result(unsafe { libc::setresgid(0, 0, 0) })?;
+            syscall_result(unsafe { libc::setresuid(0, 0, 0) })?;
+        }
         if self.initial {
             if self.policy.cgroup {
                 syscall_result(unsafe { libc::unshare(libc::CLONE_NEWCGROUP) })?;
             }
-            if self.policy.pid {
+            if let Some(user) = &self.user_namespace {
+                user.prepare_mounts(&self.policy)?;
+            } else if self.policy.pid {
                 mount_special(c"/proc", c"proc", false)?;
             }
-            if self.policy.cgroup {
+            if self.user_namespace.is_none() && self.policy.cgroup {
                 mount_special(c"/sys/fs/cgroup", c"cgroup2", true)?;
             }
-            if self.policy.ipc {
+            if self.user_namespace.is_none() && self.policy.ipc {
                 let result = unsafe { libc::mkdir(c"/dev/mqueue".as_ptr(), 0o755) };
                 if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
                     return Err(io::Error::last_os_error());
@@ -352,7 +453,11 @@ impl NamespaceParent {
 //--------------------------------------------------------------------------------------------------
 
 fn namespace_flags(policy: &WorkloadIsolation) -> i32 {
-    (if policy.mount { libc::CLONE_NEWNS } else { 0 })
+    (if policy.user.is_some() {
+        libc::CLONE_NEWUSER
+    } else {
+        0
+    }) | (if policy.mount { libc::CLONE_NEWNS } else { 0 })
         | (if policy.ipc { libc::CLONE_NEWIPC } else { 0 })
         | (if policy.uts { libc::CLONE_NEWUTS } else { 0 })
         | (if policy.pid { libc::CLONE_NEWPID } else { 0 })
@@ -399,6 +504,18 @@ fn mount_special(path: &std::ffi::CStr, kind: &std::ffi::CStr, readonly: bool) -
     let filesystem = mount::fsmount(&context, FsMountFlags::FSMOUNT_CLOEXEC, flags)?;
     // Do not leave agentd's view hidden beneath the new mount. A workload with
     // mount privileges must not reveal management proc/cgroup views by unmounting it.
+    detach_mounts(path)?;
+    mount::move_mount(
+        &filesystem,
+        c"",
+        rustix::fs::CWD,
+        path,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )?;
+    Ok(())
+}
+
+fn detach_mounts(path: &std::ffi::CStr) -> io::Result<()> {
     loop {
         if unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) } == 0 {
             continue;
@@ -411,13 +528,6 @@ fn mount_special(path: &std::ffi::CStr, kind: &std::ffi::CStr, readonly: bool) -
             return Err(error);
         }
     }
-    mount::move_mount(
-        &filesystem,
-        c"",
-        rustix::fs::CWD,
-        path,
-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-    )?;
     Ok(())
 }
 

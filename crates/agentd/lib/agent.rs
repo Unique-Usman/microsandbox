@@ -557,6 +557,7 @@ pub async fn run(
             local_transport: None,
             workload_transport_barrier_version: Some(WORKLOAD_TRANSPORT_BARRIER_VERSION),
             exec_limits: config.exec_limits,
+            workload_user_namespace: Some(true),
         },
     )
     .map_err(|e| AgentdError::ExecSession(format!("encode ready: {e}")))?;

@@ -51,13 +51,28 @@ inside that namespace. Every later exec joins the same pinned namespace set.
 The short-lived launch helper is reaped immediately; there is no persistent
 monitor or second container runtime inside the VM.
 
-PID, mount, IPC, UTS, cgroup and time namespaces are supported in the guest.
+PID, mount, IPC, UTS, cgroup, time and user namespaces are supported in the guest.
 The rootfs and configured mounts are prepared once. The workload receives private proc,
 mqueue and read-only cgroup views where requested. `--hostname` configures the
-workload's UTS namespace. Agentd keeps its own management namespaces. User
-namespaces, UID/GID mappings and joining host namespace paths from the guest are
-not implemented and fail explicitly. Host network namespace handling remains
+workload's UTS namespace. Agentd keeps its own management namespaces. Joining
+host namespace paths from the guest is not supported and fails explicitly.
+Host network namespace handling remains
 separate and unchanged; this does not add Docker port forwarding or network DNS.
+
+User namespaces use the OCI UID/GID maps once for the application's namespace;
+every later exec joins it before applying its requested user and capabilities.
+The OCI mapping's `hostID` means an ID in the **guest outside the application**,
+not an ID in the host VMM process. Both maps must include application ID 0;
+private PID and mount namespaces are required. Empty, overlapping, overflowing,
+or oversized maps are rejected. Agentd remains outside the user namespace.
+
+This does not recursively chown rootfs or bind mounts, or enable host rootless
+Docker. Files keep their existing ownership. For nonidentity mappings, prepare
+the rootfs and writable shared files with matching guest-visible owners;
+unmapped owners appear as overflow IDs and ordinary permission checks apply.
+User namespaces require an `msb` advertising `oci_user_namespace` and an agent
+advertising `workload_user_namespace`. Older peers fail with an upgrade error;
+ordinary launches and OCI configurations without a user namespace are unchanged.
 
 Time namespaces isolate monotonic and boot-time clocks, not wall-clock time or
 timezones. OCI `linux.timeOffsets` accepts `monotonic` and `boottime` offsets;

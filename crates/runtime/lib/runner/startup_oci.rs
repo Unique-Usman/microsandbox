@@ -223,6 +223,15 @@ async fn run_startup_command_inner(
         process: request.clone(),
         isolation,
     });
+    if isolated
+        .as_ref()
+        .is_some_and(|request| request.isolation.user.is_some())
+        && client.ready().agent.workload_user_namespace != Some(true)
+    {
+        return Err(RuntimeError::Custom(
+            "guest agent does not support OCI user namespaces; update agentd".into(),
+        ));
+    }
     let stream = match &isolated {
         Some(request) => {
             client
@@ -881,6 +890,60 @@ mod tests {
         .unwrap();
         assert!(matches!(result, super::StartupCommandExit::Exited(42)));
         server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn user_namespace_request_is_not_sent_to_an_older_agent() {
+        for supported in [None, Some(false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("agent.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket.write_all(&1u32.to_be_bytes()).await.unwrap();
+                socket.write_all(&100u32.to_be_bytes()).await.unwrap();
+                let ready = Message::with_payload(
+                    MessageType::Ready,
+                    0,
+                    &Ready {
+                        workload_user_namespace: supported,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                codec::write_message(&mut socket, &ready).await.unwrap();
+                assert!(
+                    codec::read_message(&mut socket).await.is_err(),
+                    "unsupported peer must not receive an execution request"
+                );
+            });
+            let command = serde_json::from_value(serde_json::json!({
+                "cmd": "true", "args": [], "env": [], "cwd": null, "user": null,
+                "isolation": {"pid":true, "mount":true, "user": {
+                    "uid_mappings":[{"container_id":0,"guest_id":0,"size":1}],
+                    "gid_mappings":[{"container_id":0,"guest_id":0,"size":1}]
+                }}
+            }))
+            .unwrap();
+            let result = super::run_startup_command(
+                &path,
+                command,
+                None,
+                None,
+                #[cfg(feature = "net")]
+                None,
+            )
+            .await;
+            let error = result
+                .err()
+                .expect("older agent must reject user namespaces");
+            assert!(error.to_string().contains("update agentd"));
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[test]

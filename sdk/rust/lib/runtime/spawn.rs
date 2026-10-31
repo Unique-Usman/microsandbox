@@ -361,6 +361,14 @@ impl LocalBackend {
         {
             launch_contract::require_oci_isolation(&resolved_runtime.msb_path).await?;
         }
+        #[cfg(feature = "oci-runtime")]
+        if let Some(json) = config.spec.labels.get("oci.microsandbox.isolation") {
+            let isolation: microsandbox_protocol::isolation::WorkloadIsolation =
+                serde_json::from_str(json)?;
+            if isolation.user.is_some() {
+                launch_contract::require_oci_user_namespace(&resolved_runtime.msb_path).await?;
+            }
+        }
         #[cfg(feature = "net")]
         launch_contract::validate_http_deny_response(&resolved_runtime.msb_path, config).await?;
         launch_contract::validate_exec_limits(&resolved_runtime.msb_path, config).await?;
@@ -752,7 +760,10 @@ impl LocalBackend {
             unsafe {
                 cmd.pre_exec(move || {
                     #[cfg(all(target_os = "linux", feature = "oci-runtime"))]
-                    enter_oci_network_namespace(network_namespace.as_ref(), isolate_network_namespace)?;
+                    enter_oci_network_namespace(
+                        network_namespace.as_ref(),
+                        isolate_network_namespace,
+                    )?;
 
                     if startup_write_fd.is_some() {
                         detach_from_launcher_session()?;
@@ -772,7 +783,10 @@ impl LocalBackend {
                     });
                     #[cfg(feature = "oci-runtime")]
                     let mut stdin_mapping = inherited_stdin.as_ref().map(|fd| {
-                        InheritedFdMapping::new(fd.as_raw_fd(), microsandbox_runtime::vm::OCI_STDIN_FD)
+                        InheritedFdMapping::new(
+                            fd.as_raw_fd(),
+                            microsandbox_runtime::vm::OCI_STDIN_FD,
+                        )
                     });
                     let mut lifecycle_mapping = InheritedFdMapping::new(
                         lifecycle_lock_fd,
