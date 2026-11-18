@@ -63,6 +63,7 @@ use crate::db::entity::{
 };
 use crate::runtime::handle::StartupProcess;
 use crate::runtime::launch_contract;
+use crate::runtime::protected_state::StoragePreparation;
 use crate::runtime::{ProcessHandle, SpawnMode};
 use crate::sandbox::{
     FsEntryKind, PullPolicy, RootDisk, RootfsSource, Sandbox, SandboxBuilder, SandboxConfig,
@@ -323,9 +324,11 @@ impl LocalBackend {
 
         // Persist ownership before any deterministic sandbox path is created. An interrupted
         // insert can leave a row, but never untracked storage.
+        let reserved_config = config.clone_for_persistence();
+        let reserved_config_json = serde_json::to_string(&reserved_config)?;
         let sandbox_id = Self::insert_sandbox_record_impl(
             db.write(),
-            &config.clone_for_persistence(),
+            &reserved_config,
             SandboxStatus::Starting,
             true,
         )
@@ -862,7 +865,15 @@ impl LocalBackend {
                     self.ensure_named_volumes(preparation, &config),
                 )
                 .await?;
-                self.prepare_sandbox_launch(&config, preparation).await?;
+                self.prepare_sandbox_launch(
+                    &config,
+                    preparation,
+                    StoragePreparation::New {
+                        catalog_id: sandbox_id,
+                        expected_config: &reserved_config_json,
+                    },
+                )
+                .await?;
                 Ok::<_, MicrosandboxError>((volumes, _branch_pin))
             })
             .await
@@ -2308,6 +2319,10 @@ impl LocalBackend {
 
         tokio::task::spawn_blocking(move || {
             let _ = std::fs::remove_file(&path);
+            // The formatter truncates an existing inode, preserving its private host mode.
+            // This disk can later be hardlinked into checkpoint and snapshot storage.
+            #[cfg(unix)]
+            microsandbox_utils::private_file::create_new(&path)?;
             ext4::format_ext4_with_tree(&path, &ext4_options, overlay_tree)
         })
         .await
@@ -2573,6 +2588,20 @@ mod tests {
         .unwrap();
         Migrator::up(pools.write().inner(), None).await.unwrap();
         pools
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_upper_is_private_before_snapshot_linking() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("upper.ext4");
+        LocalBackend::create_upper_ext4(&CreationStorage::for_test(&path), 256, None)
+            .await
+            .unwrap();
+        microsandbox_utils::private_file::verify(&fs::File::open(&path).unwrap()).unwrap();
+        let snapshot = directory.path().join("snapshot.raw");
+        fs::hard_link(&path, &snapshot).unwrap();
+        microsandbox_utils::private_file::verify(&fs::File::open(snapshot).unwrap()).unwrap();
     }
 
     #[tokio::test]
@@ -2947,7 +2976,7 @@ esac
         let created = local
             .ensure_named_volumes(
                 &crate::backend::local::creation::CreationStorage::for_test(
-                    &local.sandboxes_dir().join(&config.spec.name),
+                    local.sandboxes_dir().join(&config.spec.name),
                 ),
                 &config,
             )
@@ -4184,7 +4213,7 @@ esac
         let _volumes = local
             .ensure_named_volumes(
                 &crate::backend::local::creation::CreationStorage::for_test(
-                    &local.sandboxes_dir().join(&config.spec.name),
+                    local.sandboxes_dir().join(&config.spec.name),
                 ),
                 &config,
             )
@@ -4528,7 +4557,7 @@ esac
                 .local
                 .ensure_named_volumes(
                     &crate::backend::local::creation::CreationStorage::for_test(
-                        &fixture
+                        fixture
                             .local
                             .sandboxes_dir()
                             .join(&fixture.config.spec.name),

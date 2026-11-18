@@ -29,10 +29,13 @@ pub(crate) mod identity;
 pub mod init;
 pub mod jobs;
 pub(crate) mod metrics;
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local", feature = "cloud"))]
 mod modify;
 #[cfg(feature = "local")]
 mod patch;
+#[cfg(feature = "local")]
+pub(crate) mod storage_preview;
+mod storage_recovery;
 #[cfg(all(feature = "local", windows))]
 pub(crate) use patch::{
     windows_mark_delete, windows_open_relative_for_removal, windows_remove_open_entry,
@@ -198,6 +201,10 @@ pub use microsandbox_types::{
 pub use microsandbox_types::{ExternalMountRestorePolicy, ExternalMountWarning};
 #[cfg(feature = "local")]
 pub use restore_builder::RestoreBuilder;
+#[cfg(feature = "local")]
+#[doc(hidden)]
+pub use storage_preview::{StoragePreview, StoragePreviewEntry};
+pub use storage_recovery::{StorageRecovery, StorageRecoveryOptions, StorageRecoverySelection};
 
 #[cfg(feature = "local")]
 mod external_mounts;
@@ -208,7 +215,7 @@ pub(crate) use external_mounts::{
     external_bind_guest_paths, require_guest_mounts, require_recorded_mounts,
     resolve_external_mounts,
 };
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local", feature = "cloud"))]
 pub use modify::{
     ChangeKind, ConfigPlannedChange, ModificationConflict, ModificationDisposition,
     ModificationPolicy, ModificationWarning, PlannedChange, PublishedPortKey,
@@ -444,12 +451,24 @@ impl Sandbox {
     /// Reuses the serialized sandbox config and pinned rootfs state without
     /// re-resolving the original OCI reference. Routes through the ambient
     /// [`default_backend`](crate::backend::default_backend).
+    ///
+    /// On a Cloud sandbox, a start is refused with
+    /// [`MicrosandboxError::CloudHttp`](crate::MicrosandboxError::CloudHttp) (409) while a
+    /// secret change to it is being saved, or while its result is not yet known after
+    /// [`MicrosandboxError::ModificationNotConfirmed`](crate::MicrosandboxError::ModificationNotConfirmed);
+    /// this usually clears within seconds. Start again after a short wait.
     pub async fn start(name: &str) -> MicrosandboxResult<Self> {
         let backend = crate::backend::default_backend();
         backend.sandboxes().start(backend.clone(), name).await
     }
 
     /// Start an existing sandbox in detached/background mode.
+    ///
+    /// On a Cloud sandbox, a start is refused with
+    /// [`MicrosandboxError::CloudHttp`](crate::MicrosandboxError::CloudHttp) (409) while a
+    /// secret change to it is being saved, or while its result is not yet known after
+    /// [`MicrosandboxError::ModificationNotConfirmed`](crate::MicrosandboxError::ModificationNotConfirmed);
+    /// this usually clears within seconds. Start again after a short wait.
     pub async fn start_detached(name: &str) -> MicrosandboxResult<Self> {
         let backend = crate::backend::default_backend();
         backend
@@ -684,14 +703,13 @@ impl Sandbox {
         &self.config
     }
 
-    /// Start planning a sandbox modification.
+    /// Start a sandbox modification.
     ///
-    /// The returned builder owns the canonical SDK patch and dry-run
-    /// classification logic. It does not apply changes until later modify
-    /// phases wire the same plan model into persistence and runtime control.
-    #[cfg(feature = "local")]
+    /// Returns a builder; `dry_run` plans the patch, `apply` applies it.
+    #[cfg(any(feature = "local", feature = "cloud"))]
     pub fn modify(&self) -> SandboxModificationBuilder {
         SandboxModificationBuilder::new(self.backend.clone(), self.name.clone())
+            .bound_to(self.identity())
     }
 
     /// Explicitly compact sealed backing layers of the root and sandbox-owned data disks.
@@ -782,7 +800,7 @@ impl Sandbox {
     /// Stream log entries for this sandbox.
     ///
     /// Local streams the on-disk JSON Lines files produced by the relay tap;
-    /// cloud streams the msb-cloud SSE logs endpoint and maps each event into
+    /// cloud streams the API SSE logs endpoint and maps each event into
     /// a typed [`LogEntry`].
     pub async fn log_stream(
         &self,
